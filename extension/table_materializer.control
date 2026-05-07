@@ -1,4 +1,3 @@
 comment = 'Materializes query results into tables automatically'
 default_version = '1.0'
 relocatable = true
-schema = public
