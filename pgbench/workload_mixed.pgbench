@@ -1,0 +1,27 @@
+-- workload_mixed.pgbench
+-- Per-user event aggregation over a 500k-row unindexed events table,
+-- plus a correlated wide_metrics summary.  Exercises two different
+-- hot tables in the same transaction so both score in the heuristic.
+\set user_id random(1, 50000)
+
+SELECT
+    e.event_type,
+    COUNT(*)            AS event_count,
+    AVG(e.value)        AS avg_value,
+    MIN(e.created_at)   AS first_seen,
+    MAX(e.created_at)   AS last_seen
+FROM events e
+WHERE e.user_id = :user_id
+GROUP BY e.event_type
+ORDER BY event_count DESC;
+
+SELECT
+    cat_a,
+    cat_b,
+    COUNT(*)            AS sessions,
+    AVG(score_a)        AS avg_score_a,
+    AVG(score_b)        AS avg_score_b
+FROM wide_metrics
+WHERE user_id = :user_id
+GROUP BY cat_a, cat_b
+ORDER BY sessions DESC;

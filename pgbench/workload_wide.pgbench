@@ -1,0 +1,11 @@
+-- workload_wide.pgbench
+-- Full SELECT * on a 40-column table filtered by unindexed user_id.
+-- Each execution scans all 100k rows of wide_metrics; the wide rows
+-- (40 columns) amplify I/O pressure compared with narrow tables.
+\set user_id random(1, 50000)
+
+SELECT *
+FROM wide_metrics
+WHERE user_id = :user_id
+ORDER BY event_time DESC
+LIMIT 50;

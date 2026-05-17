@@ -1,0 +1,18 @@
+-- workload_agg.pgbench
+-- Heavy aggregation: 3-way join over 500k order_items rows with
+-- GROUP BY.  No per-run parameters — identical query text each time,
+-- so pg_stat_statements accumulates high total_exec_time quickly.
+
+SELECT
+    p.category,
+    COUNT(DISTINCT o.customer_id)       AS unique_customers,
+    SUM(oi.qty)                          AS total_units_sold,
+    SUM(oi.qty * oi.unit_price)          AS revenue,
+    AVG(oi.unit_price)                   AS avg_unit_price,
+    MAX(o.created_at)                    AS latest_order
+FROM order_items oi
+JOIN orders   o ON o.id   = oi.order_id
+JOIN products p ON p.id   = oi.product_id
+WHERE o.status != 'cancelled'
+GROUP BY p.category
+ORDER BY revenue DESC;
