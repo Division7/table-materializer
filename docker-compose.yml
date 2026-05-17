@@ -1,8 +1,8 @@
-volumes: 
+volumes:
   postgres-data:
 
 services:
-  app: 
+  db:
     container_name: database
     build:
       context: .
@@ -17,3 +17,28 @@ services:
     ports:
       - "5432:5432"
     command: postgres -c shared_preload_libraries='pg_stat_statements,table_materializer'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bench:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      DURATION: "${DURATION:-60}"
+      CLIENTS: "${CLIENTS:-4}"
+      THREADS: "${THREADS:-2}"
+    entrypoint: ["bash", "/pgbench/run.sh"]
+    profiles:
+      - bench

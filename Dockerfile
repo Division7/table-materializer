@@ -14,6 +14,8 @@ RUN git clone --depth 1 https://github.com/sraoss/pg_ivm.git /tmp/pg_ivm \
     && make install \
     && rm -rf /tmp/pg_ivm
 
-COPY "extension/" "/extension"
-
+COPY extension/ /extension/
 RUN cd /extension && make && make install
+
+# pgbench scripts are available inside both the db and bench containers.
+COPY pgbench/ /pgbench/

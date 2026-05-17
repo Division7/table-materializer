@@ -21,6 +21,9 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_operator.h"
+#include "nodes/nodeFuncs.h"
+#include "utils/syscache.h"
 
 PG_MODULE_MAGIC;
 
@@ -65,6 +68,18 @@ typedef struct
     } source_tables[MV_MAX_TABLES];
 
     /*
+     * Join columns linking consecutive source_tables pairs.
+     * join_cols[i].t0_col = column on source_tables[i],
+     * join_cols[i].t1_col = column on source_tables[i+1].
+     * Used by tm_verify_join_condition to confirm the incoming query's
+     * equijoin matches what the IMMV was built on (fail-closed safety check).
+     */
+    struct {
+        char t0_col[MV_NAME_LEN];
+        char t1_col[MV_NAME_LEN];
+    } join_cols[MV_MAX_TABLES - 1];
+
+    /*
      * Phase-2 column mapping for join rewrites.
      * col_map[table_idx][src_attno] = mv_attno.
      * has_col_map == false means the MV has an identical column layout to
@@ -101,6 +116,7 @@ static const MVRegistryEntry mv_seed_entries[] = {
             { .schema = "public", .name = "customers" },
             { .schema = "public", .name = "orders"    },
         },
+        .join_cols         = { { .t0_col = "id", .t1_col = "customer_id" } },
         .has_col_map       = false,
     },
 };
@@ -144,12 +160,42 @@ static void update_top_queries(void);
 static int  do_select_and_create_mvs(void);
 static void select_and_create_mvs(void);
 
+/* Context for the Var-remapping expression mutator used in join rewrites. */
+typedef struct
+{
+    int  varno_keep;        /* varno of source_tables[0]; becomes the IMMV varno */
+    int  varno_drop;        /* varno of source_tables[1]; remapped to varno_keep */
+    int  col_map_keep[64];  /* source_tables[0] attno → mv attno */
+    int  col_map_drop[64];  /* source_tables[1] attno → mv attno */
+    bool has_map;
+} VarRewriteCtx;
+
+/* Read-only context for pre-mutation Var mappability check. */
+typedef struct
+{
+    int varno_keep;
+    int varno_drop;
+    int col_map_keep[64];
+    int col_map_drop[64];
+} VarCheckCtx;
+
 static void tm_post_parse_analyze(ParseState *pstate, Query *query,
                                    JumbleState *jstate);
 static bool tm_match_query(Query *query, MVRegistryEntry *out_entry,
                             int matched_rte_indexes[MV_MAX_TABLES]);
 static void tm_rewrite_query(Query *query, const MVRegistryEntry *entry,
                               int matched_rte_indexes[MV_MAX_TABLES]);
+
+static void tm_build_join_col_map(Oid mv_oid, Oid src_oid0, Oid src_oid1,
+                                   int map0[64], int map1[64]);
+static bool tm_find_equijoin(Node *quals, int varno0, AttrNumber attno0,
+                              int varno1, AttrNumber attno1);
+static bool tm_verify_join_condition(Query *query, const MVRegistryEntry *entry,
+                                      int matched_rte_indexes[MV_MAX_TABLES]);
+static bool tm_has_unmapped_var(Node *node, void *context);
+static Node *tm_rewrite_var_mutator(Node *node, void *ctx);
+static void tm_rewrite_join_query(Query *query, const MVRegistryEntry *entry,
+                                   int matched_rte_indexes[MV_MAX_TABLES]);
 
 /* ----------------------------------------------------------------
  * Extension init
@@ -315,6 +361,9 @@ tm_match_query(Query *query, MVRegistryEntry *out_entry,
     MVRegistryEntry  registry_snapshot[MV_REGISTRY_MAX];
     int              num_entries;
     int              e;
+    int              best_idx        = -1;
+    int              best_src_count  = 0;
+    int              best_indexes[MV_MAX_TABLES];
 
     if (mv_registry_state == NULL)
         return false;
@@ -327,6 +376,11 @@ tm_match_query(Query *query, MVRegistryEntry *out_entry,
                num_entries * sizeof(MVRegistryEntry));
     LWLockRelease(&top_queries_locks[1].lock);
 
+    /*
+     * Scan all entries and pick the one whose source-table set is the largest
+     * superset of the query's rtable.  This ensures a 2-table join entry beats
+     * a 1-table entry that happens to match one of the joined tables.
+     */
     for (e = 0; e < num_entries; e++)
     {
         const MVRegistryEntry *entry = &registry_snapshot[e];
@@ -373,13 +427,21 @@ tm_match_query(Query *query, MVRegistryEntry *out_entry,
                 break;
         }
 
-        if (found_count == entry->num_source_tables)
+        if (found_count == entry->num_source_tables &&
+            found_count > best_src_count)
         {
-            memcpy(matched_rte_indexes, found_indexes,
-                   entry->num_source_tables * sizeof(int));
-            memcpy(out_entry, entry, sizeof(MVRegistryEntry));
-            return true;
+            best_idx       = e;
+            best_src_count = found_count;
+            memcpy(best_indexes, found_indexes, found_count * sizeof(int));
         }
+    }
+
+    if (best_idx >= 0)
+    {
+        memcpy(matched_rte_indexes, best_indexes,
+               best_src_count * sizeof(int));
+        memcpy(out_entry, &registry_snapshot[best_idx], sizeof(MVRegistryEntry));
+        return true;
     }
 
     return false;
@@ -401,10 +463,7 @@ tm_rewrite_query(Query *query, const MVRegistryEntry *entry,
 
     if (entry->num_source_tables >= 2)
     {
-        ereport(DEBUG1,
-                (errmsg("table_materializer: join rewrite for MV \"%s\".\"%s\" "
-                        "not yet implemented (phase 2)",
-                        entry->mv_schema, entry->mv_name)));
+        tm_rewrite_join_query(query, entry, matched_rte_indexes);
         return;
     }
 
@@ -458,6 +517,622 @@ tm_rewrite_query(Query *query, const MVRegistryEntry *entry,
 
     ereport(DEBUG1,
             (errmsg("table_materializer: rewrote query to use MV \"%s\".\"%s\"",
+                    entry->mv_schema, entry->mv_name)));
+}
+
+/* ----------------------------------------------------------------
+ * Join rewrite helpers
+ * ---------------------------------------------------------------- */
+
+/*
+ * Build per-table column maps: col_map[t][src_attno] = mv_attno.
+ * Uses catalog functions — no SPI, safe to call in the parse hook.
+ * Entries that cannot be matched (e.g. aliased columns) remain 0.
+ */
+static void
+tm_build_join_col_map(Oid mv_oid, Oid src_oid0, Oid src_oid1,
+                      int map0[64], int map1[64])
+{
+    HeapTuple   reltup;
+    int         mv_natts;
+    int         i;
+
+    memset(map0, 0, 64 * sizeof(int));
+    memset(map1, 0, 64 * sizeof(int));
+
+    reltup = SearchSysCache1(RELOID, ObjectIdGetDatum(mv_oid));
+    if (!HeapTupleIsValid(reltup))
+        return;
+    mv_natts = ((Form_pg_class) GETSTRUCT(reltup))->relnatts;
+    ReleaseSysCache(reltup);
+
+    for (i = 1; i <= mv_natts; i++)
+    {
+        char       *mv_attname;
+        AttrNumber  src_attno;
+
+        mv_attname = get_attname(mv_oid, i, true /* missing_ok */);
+        if (mv_attname == NULL)
+            continue;   /* dropped column */
+
+        src_attno = get_attnum(src_oid0, mv_attname);
+        if (AttributeNumberIsValid(src_attno) && src_attno > 0 && src_attno < 64)
+            map0[src_attno] = i;
+
+        src_attno = get_attnum(src_oid1, mv_attname);
+        if (AttributeNumberIsValid(src_attno) && src_attno > 0 && src_attno < 64)
+            map1[src_attno] = i;
+
+        pfree(mv_attname);
+    }
+}
+
+/*
+ * Recursively search a qual tree for an equijoin condition of the form
+ *   Var(varno0, attno0) = Var(varno1, attno1)   (or commuted).
+ * Only walks AND conjuncts and flat Lists; stops at first match.
+ */
+static bool
+tm_find_equijoin(Node *quals, int varno0, AttrNumber attno0,
+                 int varno1, AttrNumber attno1)
+{
+    if (quals == NULL)
+        return false;
+
+    if (IsA(quals, List))
+    {
+        ListCell *lc;
+
+        foreach(lc, (List *) quals)
+        {
+            if (tm_find_equijoin((Node *) lfirst(lc), varno0, attno0,
+                                 varno1, attno1))
+                return true;
+        }
+        return false;
+    }
+
+    if (IsA(quals, BoolExpr))
+    {
+        BoolExpr *bexpr = (BoolExpr *) quals;
+
+        if (bexpr->boolop == AND_EXPR)
+        {
+            ListCell *lc;
+
+            foreach(lc, bexpr->args)
+            {
+                if (tm_find_equijoin((Node *) lfirst(lc), varno0, attno0,
+                                     varno1, attno1))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    if (IsA(quals, OpExpr))
+    {
+        OpExpr    *opexpr = (OpExpr *) quals;
+        HeapTuple  optup;
+        bool       is_eq = false;
+        Var       *lvar,
+                  *rvar;
+
+        if (list_length(opexpr->args) != 2)
+            return false;
+
+        /* Verify the operator is "=" */
+        optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(opexpr->opno));
+        if (HeapTupleIsValid(optup))
+        {
+            Form_pg_operator opform = (Form_pg_operator) GETSTRUCT(optup);
+
+            is_eq = (strncmp(NameStr(opform->oprname), "=", 2) == 0);
+            ReleaseSysCache(optup);
+        }
+        if (!is_eq)
+            return false;
+
+        if (!IsA(linitial(opexpr->args), Var) ||
+            !IsA(lsecond(opexpr->args), Var))
+            return false;
+
+        lvar = (Var *) linitial(opexpr->args);
+        rvar = (Var *) lsecond(opexpr->args);
+
+        /* Check normal and commuted forms */
+        if (lvar->varno == varno0 && lvar->varattno == attno0 &&
+            rvar->varno == varno1 && rvar->varattno == attno1)
+            return true;
+        if (lvar->varno == varno1 && lvar->varattno == attno1 &&
+            rvar->varno == varno0 && rvar->varattno == attno0)
+            return true;
+    }
+
+    return false;
+}
+
+/*
+ * Verify that the query contains an equijoin condition matching each
+ * join_cols[i] for the registry entry.  Searches both JoinExpr.quals
+ * (explicit JOIN ... ON) and FromExpr.quals (implicit comma join + WHERE).
+ * Returns false if any required condition is absent — rewrite is skipped.
+ */
+static bool
+tm_verify_join_condition(Query *query, const MVRegistryEntry *entry,
+                          int matched_rte_indexes[MV_MAX_TABLES])
+{
+    int joins_to_check = entry->num_source_tables - 1;
+    int i;
+
+    for (i = 0; i < joins_to_check; i++)
+    {
+        RangeTblEntry *rte0,
+                      *rte1;
+        AttrNumber     attno0,
+                       attno1;
+        int            varno0,
+                       varno1;
+        bool           found = false;
+        ListCell      *lc;
+
+        rte0   = (RangeTblEntry *) list_nth(query->rtable,
+                                            matched_rte_indexes[i]);
+        rte1   = (RangeTblEntry *) list_nth(query->rtable,
+                                            matched_rte_indexes[i + 1]);
+        varno0 = matched_rte_indexes[i] + 1;     /* 1-based varno */
+        varno1 = matched_rte_indexes[i + 1] + 1;
+
+        attno0 = get_attnum(rte0->relid, entry->join_cols[i].t0_col);
+        attno1 = get_attnum(rte1->relid, entry->join_cols[i].t1_col);
+
+        if (!AttributeNumberIsValid(attno0) || !AttributeNumberIsValid(attno1))
+            return false;
+
+        /* Check FromExpr.quals (implicit join / top-level WHERE) */
+        if (tm_find_equijoin(query->jointree->quals,
+                             varno0, attno0, varno1, attno1))
+            found = true;
+
+        /* Check JoinExpr.quals for each explicit JOIN in fromlist */
+        if (!found)
+        {
+            foreach(lc, query->jointree->fromlist)
+            {
+                Node *node = (Node *) lfirst(lc);
+
+                if (IsA(node, JoinExpr))
+                {
+                    JoinExpr *je = (JoinExpr *) node;
+
+                    if (tm_find_equijoin(je->quals,
+                                        varno0, attno0, varno1, attno1))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!found)
+            return false;
+    }
+
+    return true;
+}
+
+/*
+ * Expression walker: returns true if any Var referencing varno_keep or
+ * varno_drop has no valid column-map entry (col_map == 0 or attno >= 64).
+ * Used as a pre-mutation safety check to prevent dangling Var references.
+ */
+static bool
+tm_has_unmapped_var(Node *node, void *context)
+{
+    VarCheckCtx *ctx = (VarCheckCtx *) context;
+
+    if (node == NULL)
+        return false;
+
+    if (IsA(node, Var))
+    {
+        Var *var = (Var *) node;
+
+        /*
+         * Whole-row and system-column Vars on the dropped RTE cannot be
+         * remapped: the mutator leaves them unchanged, but varno_drop's RTE
+         * will no longer appear in the jointree after rewrite.
+         */
+        if (var->varno == ctx->varno_drop && var->varattno <= 0)
+            return true;
+
+        if (var->varattno <= 0)
+            return false;   /* system cols on varno_keep: RTE stays, safe */
+
+        if (var->varno == ctx->varno_keep)
+        {
+            if (var->varattno >= 64 || ctx->col_map_keep[var->varattno] == 0)
+                return true;
+        }
+        else if (var->varno == ctx->varno_drop)
+        {
+            if (var->varattno >= 64 || ctx->col_map_drop[var->varattno] == 0)
+                return true;
+        }
+
+        return false;
+    }
+
+    return expression_tree_walker(node, tm_has_unmapped_var, context);
+}
+
+/*
+ * Expression mutator: rewrite Var nodes from the dropped source-table RTE
+ * to the kept (IMMV) RTE, applying the column map.  Also remaps kept-RTE
+ * Vars when the IMMV column layout differs from source_tables[0].
+ */
+static Node *
+tm_rewrite_var_mutator(Node *node, void *context)
+{
+    VarRewriteCtx *ctx = (VarRewriteCtx *) context;
+
+    if (node == NULL)
+        return NULL;
+
+    if (IsA(node, Var))
+    {
+        Var *var = (Var *) node;
+
+        if (var->varno == ctx->varno_drop)
+        {
+            Var *newvar;
+
+            if (var->varattno <= 0)
+            {
+                /* System column or whole-row ref on the dropped table. */
+                if (var->varattno == 0)
+                    ereport(WARNING,
+                            (errmsg("table_materializer: whole-row Var on "
+                                    "dropped source table varno %d during "
+                                    "join rewrite — skipping remapping",
+                                    ctx->varno_drop)));
+                return (Node *) var;   /* leave as-is; safe: not in jointree */
+            }
+
+            if (var->varattno >= 64 || ctx->col_map_drop[var->varattno] == 0)
+            {
+                ereport(DEBUG1,
+                        (errmsg("table_materializer: no col_map entry for "
+                                "varno %d attno %d during join rewrite",
+                                ctx->varno_drop, var->varattno)));
+                return (Node *) var;
+            }
+
+            newvar           = copyObject(var);
+            newvar->varno    = ctx->varno_keep;
+            newvar->varattno = ctx->col_map_drop[var->varattno];
+            return (Node *) newvar;
+        }
+
+        if (var->varno == ctx->varno_keep && ctx->has_map &&
+            var->varattno > 0 && var->varattno < 64 &&
+            ctx->col_map_keep[var->varattno] != 0)
+        {
+            Var *newvar    = copyObject(var);
+
+            newvar->varattno = ctx->col_map_keep[var->varattno];
+            return (Node *) newvar;
+        }
+
+        return (Node *) var;
+    }
+
+    return expression_tree_mutator(node, tm_rewrite_var_mutator, ctx);
+}
+
+/*
+ * Rewrite a join query in-place to use the matched IMMV.
+ *
+ * Strategy:
+ *   1. Verify the query's join predicate matches the IMMV's baked-in
+ *      condition (fail-closed: skip rewrite if uncertain).
+ *   2. Modify RTE[matched[0]] in-place to point at the IMMV (mirrors the
+ *      single-table path — keeps the varno stable).
+ *   3. Remove RTE[matched[1]] from the jointree fromlist (it stays in
+ *      query->rtable as a dead permission-check entry).
+ *   4. Remap all Var nodes referencing either source table to the IMMV RTE,
+ *      using a column map built from the catalog.
+ */
+static void
+tm_rewrite_join_query(Query *query, const MVRegistryEntry *entry,
+                      int matched_rte_indexes[MV_MAX_TABLES])
+{
+    RangeVar       rv;
+    Oid            mv_oid;
+    RangeTblEntry *rte0,
+                  *rte1;
+    Oid            src_oid0,
+                   src_oid1;
+    VarRewriteCtx  ctx;
+    JoinExpr      *found_je;      /* non-NULL if explicit JoinExpr shape */
+    ListCell      *lc;
+    bool           fixed_fromlist;
+
+    /* --- Step 1: resolve IMMV OID --- */
+    memset(&rv, 0, sizeof(rv));
+    rv.type           = T_RangeVar;
+    rv.schemaname     = (char *) entry->mv_schema;
+    rv.relname        = (char *) entry->mv_name;
+    rv.inh            = false;
+    rv.relpersistence = RELPERSISTENCE_PERMANENT;
+    rv.location       = -1;
+
+    mv_oid = RangeVarGetRelid(&rv, NoLock, true /* missing_ok */);
+    if (!OidIsValid(mv_oid))
+    {
+        ereport(DEBUG1,
+                (errmsg("table_materializer: join MV \"%s\".\"%s\" not found, "
+                        "skipping rewrite",
+                        entry->mv_schema, entry->mv_name)));
+        return;
+    }
+
+    /* --- Step 2: capture source OIDs before modifying any RTE --- */
+    rte0     = (RangeTblEntry *) list_nth(query->rtable,
+                                          matched_rte_indexes[0]);
+    rte1     = (RangeTblEntry *) list_nth(query->rtable,
+                                          matched_rte_indexes[1]);
+    src_oid0 = rte0->relid;
+    src_oid1 = rte1->relid;
+
+    /* --- Step 3: verify join predicate matches IMMV definition --- */
+    if (!tm_verify_join_condition(query, entry, matched_rte_indexes))
+    {
+        ereport(DEBUG1,
+                (errmsg("table_materializer: join predicate not verified for "
+                        "MV \"%s\".\"%s\", skipping rewrite",
+                        entry->mv_schema, entry->mv_name)));
+        return;
+    }
+
+    /* --- Step 4: build column maps from catalog --- */
+    tm_build_join_col_map(mv_oid, src_oid0, src_oid1,
+                          ctx.col_map_keep, ctx.col_map_drop);
+    ctx.varno_keep = matched_rte_indexes[0] + 1;   /* 1-based */
+    ctx.varno_drop = matched_rte_indexes[1] + 1;
+    ctx.has_map    = true;
+
+    /* --- Pre-mutation check A: validate jointree shape ---
+     * We only support two shapes:
+     *   (a) A single JoinExpr whose direct larg/rarg are both RangeTblRefs
+     *       matching varno_keep and varno_drop.
+     *   (b) Two top-level RangeTblRefs (implicit comma join) where one has
+     *       rtindex == varno_keep and the other == varno_drop.
+     * Bail before any mutation if neither shape is present — prevents
+     * silent wrong-answer bugs on 3-way joins or nested JoinExprs.
+     * found_je is set non-NULL for shape (a); it is used by check A2 below.
+     */
+    found_je = NULL;
+    {
+        bool shape_ok = false;
+
+        foreach(lc, query->jointree->fromlist)
+        {
+            Node *fnode = (Node *) lfirst(lc);
+
+            if (IsA(fnode, JoinExpr))
+            {
+                JoinExpr    *je = (JoinExpr *) fnode;
+                RangeTblRef *lr = NULL,
+                            *rr = NULL;
+
+                if (IsA(je->larg, RangeTblRef))
+                    lr = (RangeTblRef *) je->larg;
+                if (IsA(je->rarg, RangeTblRef))
+                    rr = (RangeTblRef *) je->rarg;
+
+                if (lr && rr &&
+                    ((lr->rtindex == ctx.varno_keep &&
+                      rr->rtindex == ctx.varno_drop) ||
+                     (lr->rtindex == ctx.varno_drop &&
+                      rr->rtindex == ctx.varno_keep)))
+                {
+                    found_je  = je;
+                    shape_ok  = true;
+                    break;
+                }
+            }
+        }
+
+        if (!shape_ok)
+        {
+            /* Try implicit-join shape: two top-level RangeTblRefs */
+            bool has_keep = false,
+                 has_drop = false;
+
+            foreach(lc, query->jointree->fromlist)
+            {
+                Node *fnode = (Node *) lfirst(lc);
+
+                if (IsA(fnode, RangeTblRef))
+                {
+                    int idx = ((RangeTblRef *) fnode)->rtindex;
+
+                    if (idx == ctx.varno_keep)
+                        has_keep = true;
+                    else if (idx == ctx.varno_drop)
+                        has_drop = true;
+                }
+            }
+
+            if (has_keep && has_drop)
+                shape_ok = true;
+        }
+
+        if (!shape_ok)
+        {
+            ereport(DEBUG1,
+                    (errmsg("table_materializer: unsupported jointree shape "
+                            "for MV \"%s\".\"%s\", skipping join rewrite",
+                            entry->mv_schema, entry->mv_name)));
+            return;
+        }
+    }
+
+    /* --- Pre-mutation check A2: no extra quals in the JoinExpr ---
+     * When shape (a) is used, replacing the JoinExpr with a bare RangeTblRef
+     * discards je->quals.  That is safe only if je->quals is NULL (the
+     * equijoin was in the WHERE clause) or is exactly the one OpExpr we
+     * already verified via tm_verify_join_condition.  Any additional
+     * conjuncts would be silently dropped → wrong results.
+     * We bail conservatively if the quals are not a single OpExpr matching
+     * our registered equijoin.
+     */
+    if (found_je != NULL && found_je->quals != NULL)
+    {
+        AttrNumber je_attno0 = get_attnum(src_oid0, entry->join_cols[0].t0_col);
+        AttrNumber je_attno1 = get_attnum(src_oid1, entry->join_cols[0].t1_col);
+
+        if (!IsA(found_je->quals, OpExpr) ||
+            !AttributeNumberIsValid(je_attno0) ||
+            !AttributeNumberIsValid(je_attno1) ||
+            !tm_find_equijoin(found_je->quals,
+                              ctx.varno_keep, je_attno0,
+                              ctx.varno_drop, je_attno1))
+        {
+            ereport(DEBUG1,
+                    (errmsg("table_materializer: JoinExpr has extra or "
+                            "unrecognized quals for MV \"%s\".\"%s\", "
+                            "skipping join rewrite",
+                            entry->mv_schema, entry->mv_name)));
+            return;
+        }
+    }
+
+    /* --- Pre-mutation check B: verify all Vars have valid col_map entries ---
+     * If any Var referencing either source table has no map entry (e.g. an
+     * aliased column in the IMMV), the post-mutation Var would be dangling.
+     * Bail before touching the RTE.
+     */
+    {
+        VarCheckCtx vcheck;
+
+        vcheck.varno_keep = ctx.varno_keep;
+        vcheck.varno_drop = ctx.varno_drop;
+        memcpy(vcheck.col_map_keep, ctx.col_map_keep,
+               sizeof(vcheck.col_map_keep));
+        memcpy(vcheck.col_map_drop, ctx.col_map_drop,
+               sizeof(vcheck.col_map_drop));
+
+        if (expression_tree_walker((Node *) query->targetList,
+                                   tm_has_unmapped_var, &vcheck) ||
+            expression_tree_walker(query->jointree->quals,
+                                   tm_has_unmapped_var, &vcheck) ||
+            (query->havingQual &&
+             expression_tree_walker(query->havingQual,
+                                    tm_has_unmapped_var, &vcheck)))
+        {
+            ereport(DEBUG1,
+                    (errmsg("table_materializer: column map incomplete for "
+                            "MV \"%s\".\"%s\" (aliased columns?), "
+                            "skipping join rewrite",
+                            entry->mv_schema, entry->mv_name)));
+            return;
+        }
+    }
+
+    /* --- Step 5: modify RTE[matched[0]] in-place to point at the IMMV --- */
+    {
+        RTEPermissionInfo *perminfo = NULL;
+
+        if (rte0->perminfoindex > 0)
+            perminfo = getRTEPermissionInfo(query->rteperminfos, rte0);
+
+        rte0->relid       = mv_oid;
+        rte0->relkind     = RELKIND_MATVIEW;
+        rte0->inh         = false;
+        rte0->tablesample = NULL;
+
+        if (perminfo != NULL)
+        {
+            perminfo->relid = mv_oid;
+            perminfo->inh   = false;
+        }
+    }
+
+    if (rte0->eref != NULL)
+        rte0->eref->aliasname = pstrdup(entry->mv_name);
+
+    /* --- Step 6: fix jointree — remove dropped-table refs / collapse JoinExpr --- */
+    fixed_fromlist = false;
+
+    /* Handle explicit JoinExpr: replace entire JoinExpr with RangeTblRef */
+    foreach(lc, query->jointree->fromlist)
+    {
+        Node *node = (Node *) lfirst(lc);
+
+        if (IsA(node, JoinExpr))
+        {
+            JoinExpr    *je     = (JoinExpr *) node;
+            RangeTblRef *lref   = NULL,
+                        *rref   = NULL;
+
+            if (IsA(je->larg, RangeTblRef))
+                lref = (RangeTblRef *) je->larg;
+            if (IsA(je->rarg, RangeTblRef))
+                rref = (RangeTblRef *) je->rarg;
+
+            if (lref && rref &&
+                ((lref->rtindex == ctx.varno_keep &&
+                  rref->rtindex == ctx.varno_drop) ||
+                 (lref->rtindex == ctx.varno_drop &&
+                  rref->rtindex == ctx.varno_keep)))
+            {
+                RangeTblRef *mvref = makeNode(RangeTblRef);
+
+                mvref->rtindex = ctx.varno_keep;
+                lfirst(lc)     = mvref;
+                fixed_fromlist = true;
+                break;
+            }
+        }
+    }
+
+    /* Handle implicit join: find and remove the dropped-table RangeTblRef */
+    if (!fixed_fromlist)
+    {
+        foreach(lc, query->jointree->fromlist)
+        {
+            Node *node = (Node *) lfirst(lc);
+
+            if (IsA(node, RangeTblRef) &&
+                ((RangeTblRef *) node)->rtindex == ctx.varno_drop)
+            {
+                query->jointree->fromlist =
+                    list_delete_ptr(query->jointree->fromlist, node);
+                fixed_fromlist = true;
+                break;
+            }
+        }
+    }
+
+    /* --- Step 7: remap Var nodes throughout the query expressions --- */
+    query->targetList =
+        (List *) tm_rewrite_var_mutator((Node *) query->targetList, &ctx);
+    query->jointree->quals =
+        tm_rewrite_var_mutator(query->jointree->quals, &ctx);
+    if (query->havingQual)
+        query->havingQual =
+            tm_rewrite_var_mutator(query->havingQual, &ctx);
+    if (query->returningList)
+        query->returningList =
+            (List *) tm_rewrite_var_mutator((Node *) query->returningList,
+                                            &ctx);
+
+    ereport(DEBUG1,
+            (errmsg("table_materializer: rewrote join query to use MV "
+                    "\"%s\".\"%s\"",
                     entry->mv_schema, entry->mv_name)));
 }
 
