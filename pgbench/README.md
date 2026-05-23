@@ -6,36 +6,63 @@ Materialized Views (IMMVs) via `pg_ivm`.
 
 ## Prerequisites
 
-- `psql` and `pgbench` installed locally (PostgreSQL client tools)
-- A running Postgres instance with `table_materializer` loaded — either via
-  Docker (`docker-compose up -d` from the project root) or the native setup
-  described in the top-level README
+Requires **Docker Compose v2** (the `docker compose` plugin, not the legacy
+standalone `docker-compose`).  Docker Desktop 3.3+ and Docker Engine 20.10+
+include it.  Verify with `docker compose version`.
 
 ## Quick start
+
+### Via Docker Compose (recommended)
+
+From the project root, start the database then run the benchmark in one shot:
+
+```bash
+docker compose up -d                                    # start db, wait for healthy
+docker compose --profile bench run --rm bench           # run full benchmark
+```
+
+The `bench` service is declared under the `bench` profile in
+`docker-compose.yml`, so it never starts with a plain `docker compose up`.
+The `--profile bench` flag is required to activate it.
+
+Override duration or concurrency inline:
+
+```bash
+DURATION=30 CLIENTS=8 THREADS=4 \
+  docker compose --profile bench run --rm bench
+```
+
+> **Quick smoke-test:** `DURATION=15 CLIENTS=2 THREADS=1` cuts total run time
+> to about 2 minutes.
+
+### Directly (without Docker)
+
+If you have `psql` and `pgbench` (PostgreSQL 18 client tools) installed locally
+and a PostgreSQL 18 instance with `pg_stat_statements` and `table_materializer`
+in `shared_preload_libraries`:
 
 ```bash
 # From the project root
 ./pgbench/run.sh
 ```
 
-The script auto-detects connection parameters via the standard Postgres
-environment variables. Defaults match the Docker Compose setup:
+The script reads connection parameters from the standard `PG*` environment
+variables.  When run via Docker Compose the `bench` container sets these
+automatically; when run locally supply them yourself:
 
-| Variable | Default | Notes |
-|---|---|---|
-| `PGHOST` | `localhost` | |
-| `PGPORT` | `5432` | |
-| `PGUSER` | `postgres` | |
-| `PGDATABASE` | `postgres` | |
-| `PGPASSWORD` | `postgres` | |
-| `DURATION` | `60` | seconds per workload phase |
-| `CLIENTS` | `4` | concurrent pgbench clients |
-| `THREADS` | `2` | pgbench worker threads |
-
-Override any of them inline:
+| Variable | Docker Compose default | Direct-run default | Notes |
+|---|---|---|---|
+| `PGHOST` | `db` (container name) | `localhost` | |
+| `PGPORT` | `5432` | `5432` | |
+| `PGUSER` | `postgres` | `postgres` | |
+| `PGDATABASE` | `postgres` | `postgres` | |
+| `PGPASSWORD` | `postgres` | `postgres` | |
+| `DURATION` | `60` | `60` | seconds per workload phase |
+| `CLIENTS` | `4` | `4` | concurrent pgbench clients |
+| `THREADS` | `2` | `2` | pgbench worker threads (≤ `CLIENTS`) |
 
 ```bash
-DURATION=120 CLIENTS=8 THREADS=4 ./pgbench/run.sh
+PGHOST=localhost DURATION=120 CLIENTS=8 THREADS=4 ./pgbench/run.sh
 ```
 
 ## What the script does

@@ -1,3 +1,9 @@
+## Requirements
+
+- **Docker** with the **Compose v2 plugin** (`docker compose`, not the legacy
+  standalone `docker-compose`).  Docker Desktop 3.3+ and Docker Engine 20.10+
+  both include it.  Verify with `docker compose version`.
+
 ## Getting Started
 
 Build and start the database container:
@@ -18,10 +24,11 @@ Load the extension (run once per database):
 CREATE EXTENSION table_materializer;
 ```
 
-Smoke-test:
+Verify it loaded:
 
 ```psql
-SELECT public.table_materializer_hello();
+-- Returns 0 on a fresh database (no expensive queries yet).
+SELECT table_materializer_force_spawn();
 ```
 
 Stop the stack:
