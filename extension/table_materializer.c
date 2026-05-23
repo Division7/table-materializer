@@ -96,33 +96,22 @@ typedef struct
 } MVRegistryState;
 
 /*
- * Seed entries written into shared memory on first startup.
- * The background worker will eventually overwrite these with real data.
- * TODO: replace with catalog-based loading once the BGW creates MVs.
+ * The MV registry starts empty.  It is populated at runtime by:
+ *   • the background worker (via select_and_create_mvs on each interval), and
+ *   • table_materializer_force_spawn() (on-demand SQL call).
+ *
+ * Both paths call do_select_and_create_mvs(), which queries pg_stat_statements,
+ * picks the top-N expensive tables, creates IMMVs via pg_ivm, and registers
+ * each one here so the post_parse_analyze hook can rewrite matching queries.
+ *
+ * NOTE: do not add hand-written seed entries here.  A seed entry whose
+ * backing table does not exist on disk causes the rewrite hook to silently
+ * skip ALL queries that would have matched a dynamically-created IMMV with
+ * lower source-table count, because tm_match_query picks the entry with the
+ * highest num_source_tables without checking whether the physical table
+ * exists.
  */
-static const MVRegistryEntry mv_seed_entries[] = {
-    {
-        .mv_schema         = "public",
-        .mv_name           = "orders_mv",
-        .num_source_tables = 1,
-        .source_tables     = { { .schema = "public", .name = "orders" } },
-        .has_col_map       = false,
-    },
-    {
-        .mv_schema         = "public",
-        .mv_name           = "customer_orders_mv",
-        .num_source_tables = 2,
-        .source_tables     = {
-            { .schema = "public", .name = "customers" },
-            { .schema = "public", .name = "orders"    },
-        },
-        .join_cols         = { { .t0_col = "id", .t1_col = "customer_id" } },
-        .has_col_map       = false,
-    },
-};
-
-static const int mv_seed_count =
-    sizeof(mv_seed_entries) / sizeof(mv_seed_entries[0]);
+static const int mv_seed_count = 0;
 
 /* ----------------------------------------------------------------
  * Shared state and hooks
@@ -313,12 +302,9 @@ tq_shmem_startup(void)
                                         &found);
     if (!found)
     {
-        int n = mv_seed_count < MV_REGISTRY_MAX ? mv_seed_count : MV_REGISTRY_MAX;
-
+        /* Registry starts empty; populated by the BGW / force_spawn_mvs(). */
         memset(mv_registry_state, 0, sizeof(MVRegistryState));
-        memcpy(mv_registry_state->entries, mv_seed_entries,
-               n * sizeof(MVRegistryEntry));
-        mv_registry_state->num_entries = n;
+        mv_registry_state->num_entries = mv_seed_count; /* always 0 */
     }
 }
 

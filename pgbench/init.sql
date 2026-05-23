@@ -5,7 +5,14 @@
 -- Run once before starting pgbench:
 --   psql -h localhost -U postgres -d postgres -f pgbench/init.sql
 
--- Extensions (requires shared_preload_libraries='pg_stat_statements,table_materializer')
+-- Extensions -------------------------------------------------------------------
+-- pg_stat_statements and pg_ivm must be loaded before table_materializer.
+-- In the Docker Compose setup this is handled by initdb/01-extensions.sql.
+-- When running against a local PostgreSQL instance, ensure both extensions
+-- appear in shared_preload_libraries (pg_stat_statements) / are pre-installed,
+-- then CREATE EXTENSION them here first.
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_ivm;
 CREATE EXTENSION IF NOT EXISTS table_materializer;
 
 -- Lower heuristic thresholds so queries qualify quickly during tests.
@@ -188,6 +195,11 @@ SELECT
     random() * 1000,
     NOW() - (((g % 365) || ' days')::interval)
 FROM generate_series(1, 500000) g;
+
+-- Collect fresh statistics so the planner has accurate row-count and
+-- distribution estimates before Phase 1 starts.  Without this the planner
+-- falls back to default (zero-knowledge) estimates for all six tables.
+ANALYZE customers, products, orders, order_items, wide_metrics, events;
 
 -- Reset stats so workload scripts start from a clean slate.
 SELECT pg_stat_statements_reset();

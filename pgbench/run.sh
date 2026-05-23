@@ -154,11 +154,17 @@ print_separator
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "==> Top expensive queries after IMMV phase:"
+echo "==> Top expensive queries after IMMV phase (from pg_stat_statements):"
+# Query pg_stat_statements directly so we always get fresh Phase-2 data.
+# top_expensive_queries() reads a shared-memory cache updated by the BGW,
+# which is frozen at a 5-minute interval during the benchmark and would
+# return stale Phase-1 data (or nothing) at this point.
 psql $CONN -c "
-SELECT rank,
-       round(mean_exec_time_ms::numeric,2) AS mean_ms,
+SELECT row_number() OVER (ORDER BY mean_exec_time DESC) AS rank,
+       round(mean_exec_time::numeric, 2)                AS mean_ms,
        calls,
-       left(query,80) AS query
-FROM top_expensive_queries();
+       left(query, 80)                                  AS query
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 5;
 "

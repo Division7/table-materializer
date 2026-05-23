@@ -15,7 +15,10 @@ RUN git clone --depth 1 https://github.com/sraoss/pg_ivm.git /tmp/pg_ivm \
     && rm -rf /tmp/pg_ivm
 
 COPY extension/ /extension/
-RUN cd /extension && make && make install
+RUN cd /extension && make clean && make && make install
+
+# Run once on first container start: create pg_stat_statements + pg_ivm.
+COPY initdb/ /docker-entrypoint-initdb.d/
 
 # pgbench scripts are available inside both the db and bench containers.
 COPY pgbench/ /pgbench/
