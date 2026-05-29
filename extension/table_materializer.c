@@ -1286,7 +1286,8 @@ update_top_queries(void)
  *      schema awareness, join detection, etc.
  * ================================================================
  */
-#define HEURISTIC_SCORE_EXPR  "mean_exec_time * calls"
+// #define HEURISTIC_SCORE_EXPR  "mean_exec_time * calls"
+#define HEURISTIC_SCORE_EXPR  "rows"
 
 /*
  * do_select_and_create_mvs — inner MV selection and creation logic.

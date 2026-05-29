@@ -1,0 +1,11 @@
+\section{Related Work}
+The materialized view selection problem is a cornerstone of query optimization in database management systems and data warehousing. Because exhaustively materializing all possible views is constrained by storage capacity and maintenance costs, the problem is well-established as NP-hard, prompting decades of theoretical and heuristic research.
+
+\subsubsection{Foundational Lattice Frameworks and Greedy Algorithms}
+The formalization of the view selection problem was pioneered by ~\textcite{Harinarayan_1996}, who introduced the data cube lattice framework. Their work established the theoretical bounds of the problem and proposed a greedy algorithm capable of selecting views that maximize query benefit under a given space constraint. Subsequent classic works expanded on this graph-based analytical formulation by incorporating AND-OR view graphs to capture more complex subexpression dependencies across multiple queries ~\cite{Gupta_2005,Chirkova_2012}.
+
+\subsubsection{Workload-Driven and Automated Heuristics}
+As commercial databases scaled, research shifted toward automated, workload-driven physical design. ~\textcite{Agrawal_2001} introduced the AutoAdmin tool (later evolving into the Database Tuning Advisor), which syntactically analyzed query workloads to generate candidate views and relied on the query optimizer's cost models to evaluate their utility. To handle the massive search space of candidate views, researchers introduced various heuristic searches, including randomized algorithms and genetic algorithms, to iteratively converge on near-optimal view sets without exhaustive browsing ~\textcite{Kratica_2003}.
+
+\subsubsection{Modern Machine Learning and Dynamic Adaptations}
+Recent advancements attempt to push the frontier by replacing static heuristics with learning-based models. Modern approaches model view selection as a sequential decision-making process, utilizing Deep Reinforcement Learning (DRL) to allow the system to dynamically adapt to shifting query workloads without requiring manual recalibration ~\textcite{Yuan_2020}. These learning-based prototypes demonstrate significant improvements in latency and maintenance overhead compared to traditional static analyzers.

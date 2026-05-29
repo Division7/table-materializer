@@ -1,0 +1,13 @@
+\section{Introduction}
+In modern database systems, queries often involve complex multidimensional aggregations, massive joins, and group-by operations over terabytes or petabytes of data. Computing these queries on the fly from base tables is prohibitively expensive, leading to unacceptable latency for end-users and downstream applications. The standard solution is to use materialized views—precomputed query results stored on disk. If a system precomputes and stores the exact answers (or intermediate aggregations) to frequent queries, the response time drops to near zero. However, this introduces a critical bottleneck that it is practically impossible to materialize all possible views due to two severe constraints:
+
+\begin{itemize}
+    \item Storage Capacity: The number of possible views grows exponentially with the number of dimensions in the data (e.g., a data cube with $d$ dimensions yields $2^d$ possible group-by views). Storing them all vastly exceeds available disk space.
+    \item Maintenance Overhead: Every time the underlying base tables are updated, the materialized views must be refreshed. Materializing too many views results in system degradation during update windows.Therefore, the system must intelligently identify a strict subset of views to materialize. This subset must deliver the maximum possible reduction in query execution time while strictly adhering to storage and maintenance limits.
+\end{itemize}
+
+The View Selection Problem can be formally modeled as a constrained optimization problem. We construct this formulation around a workload of queries, a space of candidate views, and a measurable cost function.
+
+Given: A query workload $Q = \{q_1, q_2, \dots, q_n\}$, where each query $q_i$ has an associated execution frequency $f_i$. A set of candidate views $V = \{v_1, v_2, \dots, v_m\}$ that can potentially be materialized. A cost function $C(q, M)$ representing the computational cost (e.g., I/O operations or estimated execution time) of answering query $q$ using a specific set of materialized views $M$, where $M \subseteq V$. If no suitable view is in $M$, the query is answered from the base tables. A storage cost function $S(v)$ representing the disk space required to store view $v$. A maximum storage capacity budget $B$.
+
+Our goal is to find a subset of views $M \subseteq V$ to materialize that minimizes the total weighted cost of executing the query workload, subject to the storage capacity constraint. Mathematically, the objective is to find $M$ that minimizes:$$ \min_{M \subseteq V} \sum_{i=1}^{n} f_i \cdot C(q_i, M) $$Subject to the capacity constraint:$$ \sum_{v \in M} S(v) \le B $$
