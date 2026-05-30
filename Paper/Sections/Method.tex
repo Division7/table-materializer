@@ -1,1 +1,8 @@
 \section{Method}
+Our extension identifies high-cost data access patterns and proactively constructs materialized views to optimize future read operations. Rather than relying on manual database administrator intervention, we employ a continuous background monitoring process that evaluates historical workload telemetry to make view materialization decisions.
+
+To minimize computational overhead and avoid generating views for transient or negligible queries, the algorithm applies a strict pre-filtering mechanism. A query $q$ is considered a candidate for materialization only if it surpasses the frequency threshold $T_{freq}$ (the number of times the query is executed) and the latency threshold $T_{lat}$ (the query's mean execution time).
+
+Once the candidate queries are identified, the system evaluates their materialization utility using a heuristic scoring function, which can be configured based on different workload characteristics. In the default implementation, the utility score is calculated as the number of invocation times the mean execution time. This heuristic prioritizes to materialize expensive queries that are frequently invoked.
+
+Given the maximum view capacity $k$, the system selects the top $k$ highest-scoring queries for materialization. The materialized views are stored in the shared-memory registry and subsequent queries are rerouted to examine the materialized views.
