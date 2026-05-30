@@ -5,4 +5,4 @@ To minimize computational overhead and avoid generating views for transient or n
 
 Once the candidate queries are identified, the system evaluates their materialization utility using a heuristic scoring function, which can be configured based on different workload characteristics. In the default implementation, the utility score is calculated as the number of invocation times the mean execution time. This heuristic prioritizes to materialize expensive queries that are frequently invoked.
 
-Given the maximum view capacity $k$, the system selects the top $k$ highest-scoring queries for materialization. The materialized views are stored in the shared-memory registry and subsequent queries are rerouted to examine the materialized views.
+Given the maximum view capacity $k$, the system selects the top $k$ highest-scoring queries for materialization. The materialized views are stored in the shared-memory registry and subsequent queries are redirected to examine the materialized views.
