@@ -147,7 +147,7 @@ The comparison table printed at the end looks like:
   WORKLOAD                    BASE_LAT    IMMV_LAT   DELTA_LAT      BASE_TPS      IMMV_TPS
 ──────────────────────────────────────────────────────────────────────────
   workload_joins              18.7 ms      0.23 ms    18.5 ms    107.0   8790.4  (98.8%)
-  workload_wide                5.1 ms      0.18 ms     5.0 ms    388.7  10937.3  (96.4%)
+  workload_wide                5.1 ms      3.6 ms      1.5 ms    388.7    551.9  (28.4%)
   workload_agg               546.6 ms    395.3 ms    151.3 ms      3.7      5.1  (27.7%)
   workload_mixed              16.6 ms      5.81 ms    10.8 ms    120.3    344.1  (65.0%)
 ──────────────────────────────────────────────────────────────────────────
@@ -155,10 +155,12 @@ The comparison table printed at the end looks like:
 ──────────────────────────────────────────────────────────────────────────
 ```
 
-The large `workload_wide` win comes from the column-subset IMMV: the query reads
-only 7 of 40 columns, so the extension materializes just those columns plus a
-covering index on `(user_id, event_time DESC)`, turning the 100k-row sequential
-scan + sort into a 50-row index scan.
+The `workload_wide` win comes from the column-subset IMMV: the query reads only
+7 of 40 columns, so the extension materializes just those columns (~3.4× narrower
+than the base row).  The IMMV still answers the query with a sequential scan +
+sort, but over far fewer heap pages, so latency drops by roughly a quarter.  The
+extension does not build secondary indexes on the IMMV — that is left to the
+operator — so this workload does not get an index-scan speedup.
 
 **DELTA_LAT** is positive when the IMMV phase is faster.  A near-zero delta
 means the query was not rewritten (the source table was not in the top-N
