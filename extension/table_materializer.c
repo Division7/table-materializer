@@ -103,6 +103,18 @@ typedef struct
      */
     int  col_map[MV_MAX_TABLES][64];
     bool has_col_map;
+
+    /*
+     * Decay bookkeeping for workload-shift eviction (see tm_evict_mvs).
+     * peak_score   = highest recent-activity score this entry has ever scored
+     *                (the EWMA of its hottest source table).
+     * cold_ticks   = consecutive BGW ticks the entry's current score has been
+     *                below evict_score_frac * peak_score; reset to 0 whenever
+     *                it recovers.  When it reaches evict_grace_ticks the IMMV
+     *                is dropped (hysteresis against bursty workloads).
+     */
+    double peak_score;
+    int    cold_ticks;
 } MVRegistryEntry;
 
 typedef struct
@@ -110,6 +122,39 @@ typedef struct
     MVRegistryEntry entries[MV_REGISTRY_MAX];
     int             num_entries;
 } MVRegistryState;
+
+/* ----------------------------------------------------------------
+ * Per-table EWMA score registry  (workload-shift detection)
+ *
+ * pg_stat_statements is cumulative, so a once-hot table keeps a high score
+ * forever — a workload shift would be invisible.  Every BGW tick we compute,
+ * per FROM-root table, the DELTA of total_exec_time since the previous tick
+ * and fold it into an exponentially-weighted moving average:
+ *
+ *     ewma = alpha * delta + (1 - alpha) * ewma
+ *
+ * A table that stops being queried contributes delta = 0 each tick, so its
+ * ewma decays geometrically toward zero — that decay is what lets the evictor
+ * (tm_evict_mvs) notice a table has gone cold and drop its IMMV.
+ * ---------------------------------------------------------------- */
+
+#define SCORE_MAX 64
+
+typedef struct
+{
+    char   tbl[NAMEDATALEN];
+    double ewma;                 /* decayed recent-activity score          */
+    double peak;                 /* highest ewma ever seen (for cold gate)  */
+    double last_total_exec_ms;   /* cumulative snapshot, for next delta     */
+    int64  last_calls;           /* cumulative snapshot (diagnostics only)  */
+    bool   in_use;
+} TableScore;
+
+typedef struct
+{
+    TableScore entries[SCORE_MAX];
+    int        num;
+} TableScoreState;
 
 /*
  * The MV registry starts empty.  It is populated at runtime by:
@@ -135,7 +180,8 @@ static const int mv_seed_count = 0;
 
 static TopQueriesState              *top_queries_state   = NULL;
 static MVRegistryState              *mv_registry_state   = NULL;
-/* slot 0 = top queries, slot 1 = mv registry */
+static TableScoreState              *table_score_state   = NULL;
+/* slot 0 = top queries, slot 1 = mv registry, slot 2 = table scores */
 static LWLockPadded                 *top_queries_locks   = NULL;
 static shmem_request_hook_type       prev_shmem_request  = NULL;
 static shmem_startup_hook_type       prev_shmem_startup  = NULL;
@@ -151,12 +197,20 @@ static int    max_mv_count          = 5;
 static int    heuristic_min_calls   = 10;
 static double heuristic_min_exec_ms = 100.0;
 
+/* ----------------------------------------------------------------
+ * Workload-shift / eviction GUC state  (see tm_evict_mvs)
+ * ---------------------------------------------------------------- */
+static double score_decay_alpha     = 0.5;   /* EWMA weight on newest delta  */
+static int    evict_grace_ticks     = 3;     /* cold ticks before a drop     */
+static double evict_score_frac      = 0.2;   /* cold = score < frac * peak   */
+
 static volatile sig_atomic_t got_sigterm = false;
 
 void _PG_init(void);
 PGDLLEXPORT void bgworker_main(Datum main_arg);
 PG_FUNCTION_INFO_V1(top_expensive_queries);
 PG_FUNCTION_INFO_V1(force_spawn_mvs);
+PG_FUNCTION_INFO_V1(list_materialized_views);
 
 static void tq_shmem_request(void);
 static void tq_shmem_startup(void);
@@ -165,6 +219,16 @@ static void update_top_queries(void);
 static int  do_select_and_create_mvs(void);
 static int  tm_create_join_mvs(int budget);
 static void select_and_create_mvs(void);
+
+static void   update_table_scores(void);
+static double tm_score_for_table(const char *name);
+static bool   tm_table_is_cold(const char *name);
+static double tm_score_for_entry(const MVRegistryEntry *entry);
+static bool   tm_drop_immv(const char *mv_name);
+static void   tm_unregister_entry(int idx);
+static void   tm_drop_and_unregister(const char *mv_name);
+static void   tm_evict_mvs(void);
+static bool   tm_try_displace(double cand_score);
 
 /*
  * Context for the Var-remapping expression mutator used in join rewrites.
@@ -259,6 +323,34 @@ _PG_init(void)
                              PGC_SIGHUP, 0,
                              NULL, NULL, NULL);
 
+    DefineCustomRealVariable("table_materializer.score_decay_alpha",
+                             "EWMA weight applied to the newest per-tick activity delta.",
+                             "Each tick a table's recent-activity score becomes "
+                             "alpha*delta + (1-alpha)*score.  Higher reacts faster to "
+                             "workload shifts (shorter memory); lower is smoother.",
+                             &score_decay_alpha,
+                             0.5, 0.0, 1.0,
+                             PGC_SIGHUP, 0,
+                             NULL, NULL, NULL);
+
+    DefineCustomIntVariable("table_materializer.evict_grace_ticks",
+                            "Consecutive cold ticks before an auto-created IMMV is dropped.",
+                            "Hysteresis against bursty workloads: an IMMV is only dropped "
+                            "after its source table has stayed cold this many BGW intervals.",
+                            &evict_grace_ticks,
+                            3, 0, 100000,
+                            PGC_SIGHUP, 0,
+                            NULL, NULL, NULL);
+
+    DefineCustomRealVariable("table_materializer.evict_score_frac",
+                             "Cold threshold as a fraction of an IMMV's peak activity score.",
+                             "An IMMV is considered cold on a tick when its current score "
+                             "falls below this fraction of the highest score it has reached.",
+                             &evict_score_frac,
+                             0.2, 0.0, 1.0,
+                             PGC_SIGHUP, 0,
+                             NULL, NULL, NULL);
+
     MarkGUCPrefixReserved("table_materializer");
 
     prev_shmem_request = shmem_request_hook;
@@ -296,7 +388,8 @@ tq_shmem_request(void)
 
     RequestAddinShmemSpace(sizeof(TopQueriesState));
     RequestAddinShmemSpace(sizeof(MVRegistryState));
-    RequestNamedLWLockTranche("table_materializer", 2);
+    RequestAddinShmemSpace(sizeof(TableScoreState));
+    RequestNamedLWLockTranche("table_materializer", 3);
 }
 
 static void
@@ -324,6 +417,12 @@ tq_shmem_startup(void)
         memset(mv_registry_state, 0, sizeof(MVRegistryState));
         mv_registry_state->num_entries = mv_seed_count; /* always 0 */
     }
+
+    table_score_state = ShmemInitStruct("table_materializer_table_scores",
+                                        sizeof(TableScoreState),
+                                        &found);
+    if (!found)
+        memset(table_score_state, 0, sizeof(TableScoreState));
 }
 
 /* ----------------------------------------------------------------
@@ -1872,9 +1971,15 @@ tm_create_join_mvs(int budget)
                     }
                 LWLockRelease(&top_queries_locks[1].lock);
 
-                if (immv_exists && already_registered)
+                if ((immv_exists && already_registered) ||
+                    (!already_registered && tm_table_is_cold(spec.tabs[0].name)))
                 {
-                    /* Nothing to do; leave success=false so it isn't counted. */
+                    /*
+                     * Either the join IMMV is already present, or the workload
+                     * has shifted away from this join (its root table has
+                     * decayed cold) — do not (re)create it.  The cold check is
+                     * what lets the evictor's drop stick after a shift.
+                     */
                     ReleaseCurrentSubTransaction();
                     MemoryContextSwitchTo(old);
                 }
@@ -1963,6 +2068,424 @@ tm_create_join_mvs(int budget)
     return created;
 }
 
+/* ================================================================
+ * WORKLOAD-SHIFT DETECTION + EVICTION
+ *
+ * update_table_scores() refreshes a per-table EWMA of recent activity each
+ * tick; tm_evict_mvs() drops IMMVs whose source tables have decayed cold; and
+ * tm_try_displace() lets a hotter table evict the weakest incumbent when the
+ * max_materialized_views budget is full.  Together these let the selected IMMV
+ * set track a changing workload instead of only ever growing.
+ * ================================================================
+ */
+
+/*
+ * Refresh the per-table EWMA score from pg_stat_statements.  Must be called
+ * with SPI connected and an active snapshot.  Groups by FROM-root table (same
+ * regexp the selection heuristic uses) and folds the per-tick delta in CALL
+ * COUNT into each table's moving average; tables absent from this tick's result
+ * decay toward zero.
+ *
+ * The score is driven by `calls`, not total_exec_time, on purpose: once a table
+ * is materialized its queries get faster, so an exec-time-based score would
+ * collapse and the evictor would wrongly drop the very IMMV that sped the table
+ * up (a self-defeating feedback loop).  Call volume is materialization-invariant
+ * — it stays high while the table is actively queried and falls to zero only
+ * when the workload genuinely shifts away, which is exactly the signal we want.
+ */
+static void
+update_table_scores(void)
+{
+    char  sql[1024];
+    int   ret;
+    int   i;
+    bool  seen[SCORE_MAX];
+
+    snprintf(sql, sizeof(sql),
+        "WITH ranked AS ("
+        "  SELECT lower((regexp_match(query,"
+        "      'FROM[[:space:]]+\"?([[:alpha:]_][[:alnum:]_]*)\"?',"
+        "      'i'))[1]) AS tbl,"
+        "    total_exec_time AS tot, calls AS ncalls"
+        "  FROM pg_stat_statements"
+        "  WHERE upper(ltrim(query)) LIKE 'SELECT%%'"
+        ")"
+        /* sum(bigint) returns numeric in PostgreSQL; cast back to int8 so
+         * SPI_getbinval + DatumGetInt64 read it correctly. */
+        " SELECT tbl, sum(tot)::float8 AS tot, sum(ncalls)::bigint AS ncalls"
+        " FROM ranked"
+        " WHERE tbl IS NOT NULL AND tbl NOT LIKE 'pg_%%'"
+        " GROUP BY tbl"
+        " ORDER BY tot DESC"
+        " LIMIT %d", SCORE_MAX);
+
+    ret = SPI_execute(sql, true, SCORE_MAX);
+    if (ret != SPI_OK_SELECT)
+        return;
+
+    LWLockAcquire(&top_queries_locks[2].lock, LW_EXCLUSIVE);
+
+    memset(seen, 0, sizeof(seen));
+
+    for (i = 0; i < (int) SPI_processed; i++)
+    {
+        bool   isnull;
+        Datum  d;
+        char  *tbl;
+        double cur_tot;
+        int64  cur_calls;
+        int    j, slot;
+        double delta;
+
+        d = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1,
+                          &isnull);
+        if (isnull)
+            continue;
+        tbl = TextDatumGetCString(d);
+
+        d = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2,
+                          &isnull);
+        cur_tot = isnull ? 0.0 : DatumGetFloat8(d);
+
+        d = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3,
+                          &isnull);
+        cur_calls = isnull ? 0 : DatumGetInt64(d);
+
+        /* locate or allocate the score slot for this table */
+        slot = -1;
+        for (j = 0; j < table_score_state->num; j++)
+            if (table_score_state->entries[j].in_use &&
+                strcmp(table_score_state->entries[j].tbl, tbl) == 0)
+            {
+                slot = j;
+                break;
+            }
+        if (slot < 0 && table_score_state->num < SCORE_MAX)
+        {
+            slot = table_score_state->num++;
+            memset(&table_score_state->entries[slot], 0, sizeof(TableScore));
+            strlcpy(table_score_state->entries[slot].tbl, tbl, NAMEDATALEN);
+            table_score_state->entries[slot].in_use = true;
+            /* first sighting: treat the whole cumulative value as the delta */
+            table_score_state->entries[slot].last_total_exec_ms = 0.0;
+        }
+        pfree(tbl);
+        if (slot < 0)
+            continue;   /* score table full */
+
+        /*
+         * delta in CALL COUNT since last tick (materialization-invariant).
+         * A drop in the cumulative count means pg_stat_statements was reset
+         * since the last tick; restart this table's moving average AND peak so
+         * a genuinely-active table is not judged cold against a stale
+         * historical peak (which would block its IMMV from being created).
+         */
+        if (cur_calls < table_score_state->entries[slot].last_calls)
+        {
+            table_score_state->entries[slot].ewma = 0.0;
+            table_score_state->entries[slot].peak = 0.0;
+            delta = (double) cur_calls;
+        }
+        else
+            delta = (double) (cur_calls -
+                              table_score_state->entries[slot].last_calls);
+
+        table_score_state->entries[slot].ewma =
+            score_decay_alpha * delta +
+            (1.0 - score_decay_alpha) * table_score_state->entries[slot].ewma;
+        if (table_score_state->entries[slot].ewma >
+            table_score_state->entries[slot].peak)
+            table_score_state->entries[slot].peak =
+                table_score_state->entries[slot].ewma;
+        table_score_state->entries[slot].last_total_exec_ms = cur_tot;
+        table_score_state->entries[slot].last_calls = cur_calls;
+        seen[slot] = true;
+    }
+
+    /* Tables that fell out of pg_stat_statements entirely still decay. */
+    for (i = 0; i < table_score_state->num; i++)
+        if (table_score_state->entries[i].in_use && !seen[i])
+            table_score_state->entries[i].ewma *= (1.0 - score_decay_alpha);
+
+    LWLockRelease(&top_queries_locks[2].lock);
+}
+
+/* Current EWMA score for a single table name (0 if unknown). */
+static double
+tm_score_for_table(const char *name)
+{
+    double s = 0.0;
+    int    j;
+
+    LWLockAcquire(&top_queries_locks[2].lock, LW_SHARED);
+    for (j = 0; j < table_score_state->num; j++)
+        if (table_score_state->entries[j].in_use &&
+            strcmp(table_score_state->entries[j].tbl, name) == 0)
+        {
+            s = table_score_state->entries[j].ewma;
+            break;
+        }
+    LWLockRelease(&top_queries_locks[2].lock);
+    return s;
+}
+
+/*
+ * Has this table decayed cold relative to its own peak activity?  Creation
+ * paths consult this so a table whose recent workload has dried up is NOT
+ * re-materialized just because its cumulative pg_stat_statements score is still
+ * high — that is what makes an eviction actually stick when the workload shifts
+ * (otherwise the evictor would drop the IMMV and the creator would immediately
+ * rebuild it on the same tick).
+ */
+static bool
+tm_table_is_cold(const char *name)
+{
+    bool   cold = false;
+    int    j;
+
+    LWLockAcquire(&top_queries_locks[2].lock, LW_SHARED);
+    for (j = 0; j < table_score_state->num; j++)
+        if (table_score_state->entries[j].in_use &&
+            strcmp(table_score_state->entries[j].tbl, name) == 0)
+        {
+            double peak = table_score_state->entries[j].peak;
+
+            cold = (peak > 0.0 &&
+                    table_score_state->entries[j].ewma < evict_score_frac * peak);
+            break;
+        }
+    LWLockRelease(&top_queries_locks[2].lock);
+    return cold;
+}
+
+/* A registry entry scores as its hottest source table (chain root carries the
+ * signal for join IMMVs). */
+static double
+tm_score_for_entry(const MVRegistryEntry *entry)
+{
+    double best = 0.0;
+    int    t;
+
+    for (t = 0; t < entry->num_source_tables; t++)
+    {
+        double s = tm_score_for_table(entry->source_tables[t].name);
+
+        if (s > best)
+            best = s;
+    }
+    return best;
+}
+
+/*
+ * Drop an auto-created IMMV.  Runs DROP TABLE ... CASCADE inside an internal
+ * subtransaction so a failure (e.g. concurrent drop) only skips this one view.
+ * pg_ivm's sql_drop event trigger removes the source-table IVM triggers and the
+ * pgivm.pg_ivm_immv catalog row.  Must be called with SPI connected.
+ */
+static bool
+tm_drop_immv(const char *mv_name)
+{
+    volatile bool ok  = false;
+    MemoryContext old = CurrentMemoryContext;
+
+    BeginInternalSubTransaction(NULL);
+    MemoryContextSwitchTo(old);
+
+    PG_TRY();
+    {
+        char sql[NAMEDATALEN + 64];
+
+        /*
+         * Be a polite background dropper: cap how long we wait for the
+         * AccessExclusiveLock so a straggler still reading this IMMV is never
+         * killed by a deadlock.  If the lock can't be had quickly the DROP
+         * errors, this subtransaction rolls back, and the next tick retries
+         * once the readers have moved on.  SET LOCAL is scoped to the
+         * subtransaction.
+         */
+        SPI_execute("SET LOCAL lock_timeout = '500ms'", false, 0);
+
+        snprintf(sql, sizeof(sql),
+                 "DROP TABLE IF EXISTS public.%s CASCADE",
+                 quote_identifier(mv_name));
+        SPI_execute(sql, false, 0);
+        ReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(old);
+        ok = true;
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(old);
+        EmitErrorReport();
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(old);
+        ok = false;
+    }
+    PG_END_TRY();
+
+    return ok;
+}
+
+/* Remove registry entry `idx`, compacting the array.  Takes the exclusive
+ * registry lock; safe against the rewrite hook, which re-resolves the IMMV OID
+ * (missing_ok) and skips if it has vanished. */
+static void
+tm_unregister_entry(int idx)
+{
+    int j;
+
+    LWLockAcquire(&top_queries_locks[1].lock, LW_EXCLUSIVE);
+    if (idx >= 0 && idx < mv_registry_state->num_entries)
+    {
+        for (j = idx; j < mv_registry_state->num_entries - 1; j++)
+            mv_registry_state->entries[j] = mv_registry_state->entries[j + 1];
+        mv_registry_state->num_entries--;
+        memset(&mv_registry_state->entries[mv_registry_state->num_entries], 0,
+               sizeof(MVRegistryEntry));
+    }
+    LWLockRelease(&top_queries_locks[1].lock);
+}
+
+/* Drop+unregister the IMMV named `mv_name` (helper for the eviction paths). */
+static void
+tm_drop_and_unregister(const char *mv_name)
+{
+    int idx, j;
+
+    if (!tm_drop_immv(mv_name))
+        return;
+
+    idx = -1;
+    LWLockAcquire(&top_queries_locks[1].lock, LW_SHARED);
+    for (j = 0; j < mv_registry_state->num_entries; j++)
+        if (strcmp(mv_registry_state->entries[j].mv_name, mv_name) == 0)
+        {
+            idx = j;
+            break;
+        }
+    LWLockRelease(&top_queries_locks[1].lock);
+
+    if (idx >= 0)
+        tm_unregister_entry(idx);
+}
+
+/*
+ * Decay-eviction pass: for each registered IMMV, track its peak score and how
+ * many consecutive ticks it has been below evict_score_frac of that peak; once
+ * that streak reaches evict_grace_ticks, drop the IMMV.  Must run with SPI
+ * connected (tm_drop_immv issues SQL).
+ */
+static void
+tm_evict_mvs(void)
+{
+    struct { char name[MV_NAME_LEN]; double cur; } dec[MV_REGISTRY_MAX];
+    char   drop_names[MV_REGISTRY_MAX][MV_NAME_LEN];
+    int    ndec = 0, ndrop = 0;
+    int    i, j, n;
+    MVRegistryEntry snap[MV_REGISTRY_MAX];
+
+    LWLockAcquire(&top_queries_locks[1].lock, LW_SHARED);
+    n = mv_registry_state->num_entries;
+    if (n > 0)
+        memcpy(snap, mv_registry_state->entries, n * sizeof(MVRegistryEntry));
+    LWLockRelease(&top_queries_locks[1].lock);
+
+    if (n <= 0)
+        return;
+
+    for (i = 0; i < n; i++)
+    {
+        strlcpy(dec[i].name, snap[i].mv_name, MV_NAME_LEN);
+        dec[i].cur = tm_score_for_entry(&snap[i]);   /* takes score lock */
+        ndec++;
+    }
+
+    /* Update peak/cold counters in place and collect drop candidates. */
+    LWLockAcquire(&top_queries_locks[1].lock, LW_EXCLUSIVE);
+    for (i = 0; i < ndec; i++)
+    {
+        for (j = 0; j < mv_registry_state->num_entries; j++)
+        {
+            MVRegistryEntry *e = &mv_registry_state->entries[j];
+            bool             is_cold;
+
+            if (strcmp(e->mv_name, dec[i].name) != 0)
+                continue;
+
+            if (dec[i].cur > e->peak_score)
+                e->peak_score = dec[i].cur;
+
+            is_cold = (e->peak_score > 0.0 &&
+                       dec[i].cur < evict_score_frac * e->peak_score);
+            if (is_cold)
+                e->cold_ticks++;
+            else
+                e->cold_ticks = 0;
+
+            if (is_cold && e->cold_ticks >= evict_grace_ticks)
+                strlcpy(drop_names[ndrop++], e->mv_name, MV_NAME_LEN);
+            break;
+        }
+    }
+    LWLockRelease(&top_queries_locks[1].lock);
+
+    for (i = 0; i < ndrop; i++)
+    {
+        tm_drop_and_unregister(drop_names[i]);
+        ereport(LOG,
+                (errmsg("table_materializer: dropped cold IMMV public.%s "
+                        "(workload shifted away)", drop_names[i])));
+    }
+}
+
+/*
+ * Budget enforcement / displacement.  When the registry is already at the
+ * max_materialized_views budget, a new candidate may only be created if it is
+ * hotter (by a 10%% margin) than the weakest incumbent, which is then dropped
+ * to free the slot.  Returns true if there is (now) room to register a new MV.
+ */
+static bool
+tm_try_displace(double cand_score)
+{
+    MVRegistryEntry snap[MV_REGISTRY_MAX];
+    char   victim[MV_NAME_LEN];
+    double worst = 0.0;
+    bool   have_victim = false;
+    int    j, n;
+
+    LWLockAcquire(&top_queries_locks[1].lock, LW_SHARED);
+    n = mv_registry_state->num_entries;
+    if (n > 0)
+        memcpy(snap, mv_registry_state->entries, n * sizeof(MVRegistryEntry));
+    LWLockRelease(&top_queries_locks[1].lock);
+
+    if (n < max_mv_count)
+        return true;   /* under budget — room already exists */
+
+    for (j = 0; j < n; j++)
+    {
+        double s = tm_score_for_entry(&snap[j]);
+
+        if (!have_victim || s < worst)
+        {
+            worst = s;
+            strlcpy(victim, snap[j].mv_name, MV_NAME_LEN);
+            have_victim = true;
+        }
+    }
+
+    if (!have_victim || cand_score <= worst * 1.1)
+        return false;   /* not hot enough to justify evicting an incumbent */
+
+    tm_drop_and_unregister(victim);
+    ereport(LOG,
+            (errmsg("table_materializer: displaced IMMV public.%s (score %.1f) "
+                    "for a hotter table (score %.1f)",
+                    victim, worst, cand_score)));
+    return true;
+}
+
 /*
  * do_select_and_create_mvs — inner MV selection and creation logic.
  *
@@ -2007,6 +2530,15 @@ do_select_and_create_mvs(void)
     int   created = 0;
     int   ret;
     int   i;
+
+    /*
+     * ---- Score + evict pass ----
+     * Refresh per-table recent-activity scores, then drop any IMMV whose
+     * source tables have gone cold (workload shifted away).  Runs before
+     * creation so freed budget can be reused by newly-hot tables this tick.
+     */
+    update_table_scores();
+    tm_evict_mvs();
 
     /*
      * ---- Join pass: create pre-joined IMMVs first ----
@@ -2089,6 +2621,24 @@ do_select_and_create_mvs(void)
          * stale entry, fall through to re-create it.
          */
         if (immv_exists && already_registered)
+            continue;
+
+        /*
+         * Recency gate: do not (re-)create an IMMV for a table whose recent
+         * activity has decayed cold relative to its peak, even if its
+         * cumulative pg_stat_statements score still ranks it.  Prevents
+         * recreating a view the evictor just dropped after a workload shift.
+         */
+        if (!already_registered && tm_table_is_cold(tbl))
+            continue;
+
+        /*
+         * Respect the max_materialized_views budget.  If the registry is full,
+         * only proceed when this candidate is hot enough to displace the
+         * weakest incumbent (which tm_try_displace then drops).  Otherwise skip
+         * it this tick rather than growing the set past the budget.
+         */
+        if (!already_registered && !tm_try_displace(tm_score_for_table(tbl)))
             continue;
 
         if (!immv_exists)
@@ -2296,6 +2846,98 @@ top_expensive_queries(PG_FUNCTION_ARGS)
         values[1] = CStringGetTextDatum(snapshot[i].query);
         values[2] = Float8GetDatum(snapshot[i].mean_exec_time_ms);
         values[3] = Int64GetDatum(snapshot[i].calls);
+
+        tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+        SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+    }
+
+    SRF_RETURN_DONE(funcctx);
+}
+
+/* ----------------------------------------------------------------
+ * SQL-callable function: table_materializer_list_mvs()
+ *
+ * Returns the current auto-created IMMV registry with each entry's live
+ * recent-activity score and cold-tick counter, for observing how the selected
+ * set shifts as the workload changes.
+ * ---------------------------------------------------------------- */
+
+/* One row of the list_materialized_views() result snapshot. */
+typedef struct
+{
+    char   mv_name[MV_NAME_LEN];
+    int    num_source_tables;
+    double score;
+    int    cold_ticks;
+} MVListRow;
+
+Datum
+list_materialized_views(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    MVListRow       *rows;
+
+    if (SRF_IS_FIRSTCALL())
+    {
+        MemoryContext   oldctx;
+        TupleDesc       tupdesc;
+        MVRegistryEntry snap[MV_REGISTRY_MAX];
+        int             n = 0;
+        int             i;
+
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldctx  = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        if (mv_registry_state != NULL)
+        {
+            LWLockAcquire(&top_queries_locks[1].lock, LW_SHARED);
+            n = mv_registry_state->num_entries;
+            if (n > 0)
+                memcpy(snap, mv_registry_state->entries,
+                       n * sizeof(MVRegistryEntry));
+            LWLockRelease(&top_queries_locks[1].lock);
+        }
+
+        rows = (MVListRow *) palloc0(sizeof(MVListRow) * (n > 0 ? n : 1));
+        for (i = 0; i < n; i++)
+        {
+            strlcpy(rows[i].mv_name, snap[i].mv_name, MV_NAME_LEN);
+            rows[i].num_source_tables = snap[i].num_source_tables;
+            rows[i].score             = tm_score_for_entry(&snap[i]);
+            rows[i].cold_ticks        = snap[i].cold_ticks;
+        }
+
+        funcctx->user_fctx = rows;
+        funcctx->max_calls = n;
+
+        tupdesc = CreateTemplateTupleDesc(4);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 1, "mv_name",
+                           TEXTOID, -1, 0);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 2, "num_source_tables",
+                           INT4OID, -1, 0);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 3, "score",
+                           FLOAT8OID, -1, 0);
+        TupleDescInitEntry(tupdesc, (AttrNumber) 4, "cold_ticks",
+                           INT4OID, -1, 0);
+        funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+        MemoryContextSwitchTo(oldctx);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    rows    = (MVListRow *) funcctx->user_fctx;
+
+    if (funcctx->call_cntr < funcctx->max_calls)
+    {
+        int       i = funcctx->call_cntr;
+        Datum     values[4];
+        bool      nulls[4] = {false, false, false, false};
+        HeapTuple tuple;
+
+        values[0] = CStringGetTextDatum(rows[i].mv_name);
+        values[1] = Int32GetDatum(rows[i].num_source_tables);
+        values[2] = Float8GetDatum(rows[i].score);
+        values[3] = Int32GetDatum(rows[i].cold_ticks);
 
         tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
         SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));

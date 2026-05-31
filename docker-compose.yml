@@ -42,3 +42,25 @@ services:
     entrypoint: ["bash", "/pgbench/run.sh"]
     profiles:
       - bench
+
+  shift:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      DURATION: "${DURATION:-45}"
+      CLIENTS: "${CLIENTS:-4}"
+      THREADS: "${THREADS:-2}"
+      INTERVAL_MS: "${INTERVAL_MS:-2000}"
+      MAX_MV: "${MAX_MV:-5}"
+    entrypoint: ["bash", "/pgbench/shift_demo.sh"]
+    profiles:
+      - shift

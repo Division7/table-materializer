@@ -166,15 +166,60 @@ no dead tuples, better page density, and a warmer buffer cache by the time
 Phase 2 starts.  Pre-aggregating or pre-filtering the IMMV query would yield
 larger gains; that is a planned extension to the heuristic.
 
+## Shifting-workload demo
+
+`run.sh` proves IMMVs are *created* and speed queries up. `shift_demo.sh` proves
+the selected set can **shift over time** — old IMMVs are dropped as their tables
+go cold and new ones are created for newly-hot tables.
+
+```bash
+docker compose up -d
+docker compose --profile shift run --rm shift     # or: ./pgbench/shift_demo.sh
+```
+
+Unlike `run.sh` (which freezes the worker for a deterministic benchmark),
+`shift_demo.sh` runs the **live** worker on a short interval (`INTERVAL_MS`,
+default 2000 ms) and lets it create *and* evict autonomously:
+
+1. **Phase A** drives `shift_a_join.pgbench` — a 4-way join over `{customers,
+   orders, order_items, products}`. The worker materializes a pre-joined IMMV
+   (and a mirror of the join root). → **Snapshot 1**
+2. **Phase B** drives `shift_b_events.pgbench` + `shift_b_wide.pgbench` —
+   `{events, wide_metrics}`. The worker materializes IMMVs for these and the
+   now-cold Phase-A IMMVs decay and are dropped. → **Snapshot 2**
+3. The script **asserts** the set shifted (A-IMMVs gone, B-IMMVs present) and
+   exits non-zero otherwise.
+
+Env knobs: `DURATION` (seconds per phase, default 45), `CLIENTS`, `THREADS`,
+`INTERVAL_MS`, `MAX_MV` (budget; `MAX_MV=1` forces the displacement path),
+`POLL_TIMEOUT`. The shift is driven by a per-table EWMA of recent query
+**volume** (call rate, which — unlike execution time — does not collapse once a
+table is materialized); the GUCs `score_decay_alpha`, `evict_grace_ticks`, and
+`evict_score_frac` tune how fast a cold table's IMMV is evicted (see the
+top-level `README.md`).
+
+Watch it live in another shell:
+
+```sql
+SELECT * FROM table_materializer_list_mvs();   -- score + cold_ticks per IMMV
+```
+
+> The MV registry lives in shared memory, so for a pristine re-run without state
+> from a previous demo, `docker compose restart db` first.
+
 ## Files
 
 ```
 pgbench/
 ├── README.md                  this file
 ├── init.sql                   schema setup, threshold overrides, cleanup
-├── run.sh                     full benchmark driver
+├── run.sh                     full benchmark driver (create + speedup)
+├── shift_demo.sh              shifting-workload driver (create + evict, asserts)
 ├── workload_joins.pgbench     4-way join workload
 ├── workload_wide.pgbench      wide-table scan workload
 ├── workload_agg.pgbench       aggregation workload (static query)
-└── workload_mixed.pgbench     dual-table aggregation workload
+├── workload_mixed.pgbench     dual-table aggregation workload
+├── shift_a_join.pgbench       Phase-A join workload (customers/orders/...)
+├── shift_b_events.pgbench     Phase-B events aggregation
+└── shift_b_wide.pgbench       Phase-B wide_metrics scan
 ```

@@ -1,0 +1,16 @@
+-- shift_b_events.pgbench  —  PHASE B workload
+-- Heavy aggregation over the full 500k-row, unindexed events table.  The query
+-- text is identical every call (no parameters), so pg_stat_statements
+-- accumulates high total_exec_time on `events` quickly and the worker
+-- materializes events_auto_mv.  `events` is never touched in Phase A.
+
+SELECT
+    event_type,
+    COUNT(*)         AS n,
+    AVG(value)       AS avg_value,
+    SUM(value)       AS sum_value,
+    MIN(created_at)  AS first_seen,
+    MAX(created_at)  AS last_seen
+FROM events
+GROUP BY event_type
+ORDER BY n DESC;
