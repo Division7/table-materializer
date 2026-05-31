@@ -252,13 +252,21 @@ typedef struct
     int n_tables;
     int varno_of_table[MV_MAX_TABLES];
     int (*col_map)[64];
+    /*
+     * When true, any whole-row / system-column Var (varattno <= 0) on a matched
+     * table is treated as unmapped.  A column-subset IMMV has a different
+     * rowtype than its base table, so a whole-row reference cannot be served
+     * from it — it must disqualify the rewrite.  The join path leaves this false
+     * (it preserves the historical kept-table behavior).
+     */
+    bool disallow_wholerow;
 } VarCheckCtx;
 
 static void tm_post_parse_analyze(ParseState *pstate, Query *query,
                                    JumbleState *jstate);
 static bool tm_entry_tables_present(Query *query, const MVRegistryEntry *entry,
                                     int matched_rte_indexes[MV_MAX_TABLES]);
-static void tm_rewrite_single(Query *query, const MVRegistryEntry *entry,
+static bool tm_rewrite_single(Query *query, const MVRegistryEntry *entry,
                               int matched_rte_indexes[MV_MAX_TABLES]);
 
 static bool tm_find_equijoin(Node *quals, int varno0, AttrNumber attno0,
@@ -494,8 +502,9 @@ tm_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
             }
             else
             {
-                tm_rewrite_single(query, entry, matched_rte_indexes);
-                return;
+                if (tm_rewrite_single(query, entry, matched_rte_indexes))
+                    return;
+                /* column-subset verification failed — try the next candidate */
             }
         }
     }
@@ -553,16 +562,29 @@ tm_entry_tables_present(Query *query, const MVRegistryEntry *entry,
 }
 
 /*
- * Single-table rewrite: replace the matched source table's relid/relkind in
- * its RTE so the query reads from the IMMV mirror instead of the base table.
+ * Single-table rewrite: point the matched source table's RTE at its IMMV.
+ *
+ * Two flavors, selected by entry->has_col_map:
+ *   - full mirror (has_col_map == false): the IMMV is "SELECT * FROM tbl" with
+ *     an identical column layout, so we only repoint the RTE's relid/relkind.
+ *   - column subset (has_col_map == true): the IMMV holds a projection of the
+ *     base table, so every Var on the matched table must (a) be present in the
+ *     subset and (b) have its varattno remapped to the IMMV's column position.
+ *     We fail-closed: if any referenced column (or a whole-row/system Var) is
+ *     absent from the subset, we leave the query untouched and return false so
+ *     the caller can try another registry entry or fall back to the base table.
+ *
+ * Returns true if the query was rewritten onto the IMMV.
  */
-static void
+static bool
 tm_rewrite_single(Query *query, const MVRegistryEntry *entry,
                   int matched_rte_indexes[MV_MAX_TABLES])
 {
     RangeTblEntry *rte;
     RangeVar       rv;
     Oid            mv_oid;
+    int            keep = matched_rte_indexes[0] + 1;   /* 1-based varno */
+    VarRewriteCtx  ctx;
 
     rte = (RangeTblEntry *) list_nth(query->rtable, matched_rte_indexes[0]);
 
@@ -582,7 +604,65 @@ tm_rewrite_single(Query *query, const MVRegistryEntry *entry,
                 (errmsg("table_materializer: MV \"%s\".\"%s\" not found, "
                         "skipping rewrite",
                         entry->mv_schema, entry->mv_name)));
-        return;
+        return false;
+    }
+
+    /* Column-subset IMMV: build the remap context and verify mappability. */
+    if (entry->has_col_map)
+    {
+        VarCheckCtx vcheck;
+        bool        unmapped;
+        ListCell   *lc;
+
+        ctx.varno_keep        = keep;
+        ctx.n_tables          = 1;
+        ctx.varno_of_table[0] = keep;
+        ctx.col_map           = (int (*)[64]) entry->col_map;
+
+        vcheck.varno_keep        = keep;
+        vcheck.n_tables          = 1;
+        vcheck.varno_of_table[0] = keep;
+        vcheck.col_map           = ctx.col_map;
+        vcheck.disallow_wholerow = true;   /* subset has a different rowtype */
+
+        unmapped =
+            expression_tree_walker((Node *) query->targetList,
+                                   tm_has_unmapped_var, &vcheck) ||
+            (query->jointree &&
+             expression_tree_walker(query->jointree->quals,
+                                    tm_has_unmapped_var, &vcheck)) ||
+            (query->havingQual &&
+             expression_tree_walker(query->havingQual,
+                                    tm_has_unmapped_var, &vcheck)) ||
+            (query->returningList &&
+             expression_tree_walker((Node *) query->returningList,
+                                    tm_has_unmapped_var, &vcheck));
+
+        /* GROUP BY expressions live in an RTE_GROUP entry (PG17+). */
+        if (!unmapped)
+        {
+            foreach(lc, query->rtable)
+            {
+                RangeTblEntry *grte = (RangeTblEntry *) lfirst(lc);
+
+                if (grte->rtekind == RTE_GROUP &&
+                    expression_tree_walker((Node *) grte->groupexprs,
+                                           tm_has_unmapped_var, &vcheck))
+                {
+                    unmapped = true;
+                    break;
+                }
+            }
+        }
+
+        if (unmapped)
+        {
+            ereport(DEBUG1,
+                    (errmsg("table_materializer: query references columns absent "
+                            "from subset MV \"%s\".\"%s\", skipping rewrite",
+                            entry->mv_schema, entry->mv_name)));
+            return false;
+        }
     }
 
     /*
@@ -611,9 +691,39 @@ tm_rewrite_single(Query *query, const MVRegistryEntry *entry,
     if (rte->eref != NULL)
         rte->eref->aliasname = pstrdup(entry->mv_name);
 
+    /* Column-subset IMMV: remap every Var's attno to its IMMV position. */
+    if (entry->has_col_map)
+    {
+        ListCell *lc;
+
+        query->targetList =
+            (List *) tm_rewrite_var_mutator((Node *) query->targetList, &ctx);
+        if (query->jointree)
+            query->jointree->quals =
+                tm_rewrite_var_mutator(query->jointree->quals, &ctx);
+        if (query->havingQual)
+            query->havingQual =
+                tm_rewrite_var_mutator(query->havingQual, &ctx);
+        if (query->returningList)
+            query->returningList =
+                (List *) tm_rewrite_var_mutator((Node *) query->returningList,
+                                                &ctx);
+
+        foreach(lc, query->rtable)
+        {
+            RangeTblEntry *grte = (RangeTblEntry *) lfirst(lc);
+
+            if (grte->rtekind == RTE_GROUP)
+                grte->groupexprs =
+                    (List *) tm_rewrite_var_mutator((Node *) grte->groupexprs,
+                                                    &ctx);
+        }
+    }
+
     ereport(DEBUG1,
             (errmsg("table_materializer: rewrote query to use MV \"%s\".\"%s\"",
                     entry->mv_schema, entry->mv_name)));
+    return true;
 }
 
 /* ----------------------------------------------------------------
@@ -753,7 +863,11 @@ tm_has_unmapped_var(Node *node, void *context)
          * are safe because that RTE survives, repointed at the IMMV.
          */
         if (var->varattno <= 0)
+        {
+            if (ctx->disallow_wholerow)
+                return true;
             return (ctx->varno_of_table[t] != ctx->varno_keep);
+        }
 
         if (var->varattno >= 64 || ctx->col_map[t][var->varattno] == 0)
             return true;
@@ -1085,9 +1199,10 @@ tm_try_rewrite_join(Query *query, const MVRegistryEntry *entry,
         VarCheckCtx vcheck;
         bool        unmapped;
 
-        vcheck.varno_keep = ctx.varno_keep;
-        vcheck.n_tables   = ctx.n_tables;
-        vcheck.col_map    = ctx.col_map;
+        vcheck.varno_keep        = ctx.varno_keep;
+        vcheck.n_tables          = ctx.n_tables;
+        vcheck.col_map           = ctx.col_map;
+        vcheck.disallow_wholerow = false;   /* join path: keep historical behavior */
         memcpy(vcheck.varno_of_table, ctx.varno_of_table,
                sizeof(vcheck.varno_of_table));
 
@@ -2486,6 +2601,419 @@ tm_try_displace(double cand_score)
     return true;
 }
 
+/* ================================================================
+ * SINGLE-TABLE COLUMN-SUBSET PLANNING
+ *
+ * For a hot single-table query we materialize only the columns the query
+ * actually touches (target list + WHERE + ORDER BY + GROUP BY + HAVING) rather
+ * than mirroring the whole — possibly very wide — row, and we add a covering
+ * index on the equality-predicate and ORDER BY columns.  The narrow subset is
+ * far cheaper to scan and to keep incrementally maintained, and the index turns
+ * a "WHERE x = ? ORDER BY y LIMIT n" sequential-scan-plus-sort into an index
+ * scan.  Queries that reference a column outside the subset fail the rewrite's
+ * fail-closed col_map check and simply read the base table.
+ * ================================================================ */
+
+#define TM_MAX_PROJ_COLS 63    /* col_map src_attno index must stay < 64 */
+#define TM_MAX_SORT_COLS 8
+
+/* One projected output column and the base-table attno it came from. */
+typedef struct
+{
+    int  src_attno;
+    char name[NAMEDATALEN];
+} ProjCol;
+
+/* Accumulates distinct column names referenced by a query (raw parse tree). */
+typedef struct
+{
+    char names[TM_MAX_PROJ_COLS][NAMEDATALEN];
+    int  n;
+    bool has_star;     /* a "*" / "t.*" reference — cannot project */
+    bool overflow;     /* more distinct columns than we can track  */
+} ColRefSet;
+
+/* Equality-predicate and ORDER BY columns that drive the covering index. */
+typedef struct
+{
+    char eq[TM_MAX_PROJ_COLS][NAMEDATALEN];
+    int  n_eq;
+    struct { char name[NAMEDATALEN]; bool desc; } sort[TM_MAX_SORT_COLS];
+    int  n_sort;
+} IndexSpec;
+
+/*
+ * Extract a bare column name from a raw ColumnRef.  Returns false (and sets
+ * *is_star) for "*"/"t.*"; for "col" or "alias"."col" returns the trailing
+ * column name (single-table queries make the alias irrelevant).
+ */
+static bool
+tm_colref_name(ColumnRef *cr, char *out, size_t outlen, bool *is_star)
+{
+    Node *last;
+
+    *is_star = false;
+    if (cr->fields == NIL)
+        return false;
+
+    last = (Node *) llast(cr->fields);
+    if (IsA(last, A_Star))
+    {
+        *is_star = true;
+        return false;
+    }
+    if (IsA(last, String))
+    {
+        strlcpy(out, strVal(last), outlen);
+        return true;
+    }
+    return false;
+}
+
+/* raw_expression_tree_walker callback: collect ColumnRef names into a ColRefSet. */
+static bool
+tm_collect_colrefs_walker(Node *node, void *context)
+{
+    ColRefSet *s = (ColRefSet *) context;
+
+    if (node == NULL)
+        return false;
+
+    if (IsA(node, ColumnRef))
+    {
+        char nm[NAMEDATALEN];
+        bool star;
+        int  i;
+
+        if (!tm_colref_name((ColumnRef *) node, nm, sizeof(nm), &star))
+        {
+            if (star)
+                s->has_star = true;
+            return false;
+        }
+        for (i = 0; i < s->n; i++)
+            if (pg_strcasecmp(s->names[i], nm) == 0)
+                return false;       /* already recorded */
+        if (s->n >= TM_MAX_PROJ_COLS)
+        {
+            s->overflow = true;
+            return false;
+        }
+        strlcpy(s->names[s->n++], nm, NAMEDATALEN);
+        return false;
+    }
+
+    return raw_expression_tree_walker(node, tm_collect_colrefs_walker, context);
+}
+
+static void
+tm_add_eq_col(IndexSpec *ix, const char *name)
+{
+    int i;
+
+    for (i = 0; i < ix->n_eq; i++)
+        if (pg_strcasecmp(ix->eq[i], name) == 0)
+            return;
+    if (ix->n_eq < TM_MAX_PROJ_COLS)
+        strlcpy(ix->eq[ix->n_eq++], name, NAMEDATALEN);
+}
+
+/*
+ * Walk a raw WHERE clause collecting columns that appear on one side of a
+ * "col = <non-column>" equality (the useful leading index columns).  Only AND
+ * conjuncts are descended into; OR branches are skipped (an index on them would
+ * not be guaranteed usable).
+ */
+static void
+tm_collect_eq_cols(Node *node, IndexSpec *ix)
+{
+    if (node == NULL)
+        return;
+
+    if (IsA(node, BoolExpr))
+    {
+        BoolExpr *b = (BoolExpr *) node;
+        ListCell *lc;
+
+        if (b->boolop == AND_EXPR)
+            foreach(lc, b->args)
+                tm_collect_eq_cols((Node *) lfirst(lc), ix);
+        return;
+    }
+
+    if (IsA(node, A_Expr))
+    {
+        A_Expr *ae = (A_Expr *) node;
+        char    nm[NAMEDATALEN];
+        bool    star;
+
+        if (ae->kind != AEXPR_OP || list_length(ae->name) != 1 ||
+            strcmp(strVal(linitial(ae->name)), "=") != 0)
+            return;
+
+        if (ae->lexpr && IsA(ae->lexpr, ColumnRef) &&
+            !(ae->rexpr && IsA(ae->rexpr, ColumnRef)) &&
+            tm_colref_name((ColumnRef *) ae->lexpr, nm, sizeof(nm), &star) && !star)
+            tm_add_eq_col(ix, nm);
+        else if (ae->rexpr && IsA(ae->rexpr, ColumnRef) &&
+                 !(ae->lexpr && IsA(ae->lexpr, ColumnRef)) &&
+                 tm_colref_name((ColumnRef *) ae->rexpr, nm, sizeof(nm), &star) && !star)
+            tm_add_eq_col(ix, nm);
+    }
+}
+
+/* Collect ORDER BY columns (with direction) for the covering index. */
+static void
+tm_collect_sort_cols(List *sortClause, IndexSpec *ix)
+{
+    ListCell *lc;
+
+    foreach(lc, sortClause)
+    {
+        SortBy *sb = lfirst_node(SortBy, lc);
+        char    nm[NAMEDATALEN];
+        bool    star;
+
+        if (sb->node && IsA(sb->node, ColumnRef) &&
+            tm_colref_name((ColumnRef *) sb->node, nm, sizeof(nm), &star) && !star)
+        {
+            if (ix->n_sort >= TM_MAX_SORT_COLS)
+                return;
+            strlcpy(ix->sort[ix->n_sort].name, nm, NAMEDATALEN);
+            ix->sort[ix->n_sort].desc = (sb->sortby_dir == SORTBY_DESC);
+            ix->n_sort++;
+        }
+    }
+}
+
+/*
+ * Plan a column-subset IMMV for single-table candidate `tbl` from its hottest
+ * query text `query_text` (normalized text straight out of pg_stat_statements).
+ *
+ * On success returns true and fills:
+ *   proj    — comma-separated, quoted projection column list (attno order)
+ *   recs    — (src_attno, name) for each projected column; *nrecs set
+ *   idxcols — comma-separated covering-index column list (may be empty)
+ *
+ * Returns false — caller falls back to a full "SELECT *" mirror — when the
+ * query is not a simple single-table SELECT on `tbl`, uses "*"/whole-row refs,
+ * references a column with attno >= 64 (cannot be col-mapped), or no referenced
+ * column resolves to a live base column.
+ *
+ * Runs raw_parser, which can ereport on truncated/odd text; the caller wraps
+ * the call in a subtransaction.
+ */
+static bool
+tm_plan_single_projection(const char *tbl, const char *query_text,
+                          StringInfo proj, ProjCol *recs, int *nrecs,
+                          StringInfo idxcols)
+{
+    List       *pl;
+    RawStmt    *rs;
+    SelectStmt *sel;
+    RangeVar   *rv;
+    ColRefSet   set;
+    IndexSpec   ix;
+    Oid         argt[1];
+    Datum       argv[1];
+    int         ret, i, c;
+    int         pos = 0;
+
+    memset(&set, 0, sizeof(set));
+    memset(&ix, 0, sizeof(ix));
+    *nrecs = 0;
+
+    pl = raw_parser(query_text, RAW_PARSE_DEFAULT);
+    if (list_length(pl) != 1)
+        return false;
+    rs = linitial_node(RawStmt, pl);
+    if (!IsA(rs->stmt, SelectStmt))
+        return false;
+    sel = (SelectStmt *) rs->stmt;
+
+    /* Plain SELECT over exactly the one base table (no set ops, DISTINCT,
+     * join, or subselect/CTE in FROM). */
+    if (sel->op != SETOP_NONE || sel->distinctClause != NIL)
+        return false;
+    if (list_length(sel->fromClause) != 1 ||
+        !IsA(linitial(sel->fromClause), RangeVar))
+        return false;
+    rv = linitial_node(RangeVar, sel->fromClause);
+    if (rv->relname == NULL || pg_strcasecmp(rv->relname, tbl) != 0)
+        return false;
+
+    /* Gather every column the query references. */
+    raw_expression_tree_walker((Node *) sel->targetList,
+                               tm_collect_colrefs_walker, &set);
+    if (sel->whereClause)
+        raw_expression_tree_walker(sel->whereClause,
+                                   tm_collect_colrefs_walker, &set);
+    if (sel->sortClause)
+        raw_expression_tree_walker((Node *) sel->sortClause,
+                                   tm_collect_colrefs_walker, &set);
+    if (sel->groupClause)
+        raw_expression_tree_walker((Node *) sel->groupClause,
+                                   tm_collect_colrefs_walker, &set);
+    if (sel->havingClause)
+        raw_expression_tree_walker(sel->havingClause,
+                                   tm_collect_colrefs_walker, &set);
+
+    if (set.has_star || set.overflow || set.n == 0)
+        return false;
+
+    tm_collect_eq_cols(sel->whereClause, &ix);
+    tm_collect_sort_cols(sel->sortClause, &ix);
+
+    /* Resolve referenced names to live base-table attnos, in attno order. */
+    argt[0] = TEXTOID;
+    argv[0] = CStringGetTextDatum(tbl);
+    ret = SPI_execute_with_args(
+            "SELECT a.attnum::int, a.attname::text "
+            "FROM pg_attribute a "
+            "WHERE a.attrelid = ('public.' || quote_ident($1))::regclass "
+            "  AND a.attnum > 0 AND NOT a.attisdropped "
+            "ORDER BY a.attnum",
+            1, argt, argv, " ", true, 0);
+    if (ret != SPI_OK_SELECT || SPI_processed == 0)
+        return false;
+
+    for (i = 0; i < (int) SPI_processed; i++)
+    {
+        bool  isn;
+        int   attnum = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+                                        SPI_tuptable->tupdesc, 1, &isn));
+        char *aname = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[i],
+                                        SPI_tuptable->tupdesc, 2, &isn));
+        bool  used = false;
+        int   k;
+
+        for (k = 0; k < set.n; k++)
+            if (pg_strcasecmp(set.names[k], aname) == 0)
+            {
+                used = true;
+                break;
+            }
+        if (!used)
+            continue;
+        if (attnum >= 64)
+            return false;       /* cannot represent in col_map */
+
+        if (pos > 0)
+            appendStringInfoString(proj, ", ");
+        appendStringInfoString(proj, quote_identifier(aname));
+        recs[pos].src_attno = attnum;
+        strlcpy(recs[pos].name, aname, NAMEDATALEN);
+        pos++;
+    }
+
+    if (pos == 0)
+        return false;
+    *nrecs = pos;
+
+    /* Covering-index columns: equality columns first (leading, ASC), then
+     * ORDER BY columns (with direction).  Only projected columns are eligible. */
+    c = 0;
+    for (i = 0; i < ix.n_eq; i++)
+    {
+        int  k;
+        bool projected = false;
+
+        for (k = 0; k < pos; k++)
+            if (pg_strcasecmp(recs[k].name, ix.eq[i]) == 0) { projected = true; break; }
+        if (!projected)
+            continue;
+        if (c++ > 0)
+            appendStringInfoString(idxcols, ", ");
+        appendStringInfoString(idxcols, quote_identifier(ix.eq[i]));
+    }
+    for (i = 0; i < ix.n_sort; i++)
+    {
+        int  k;
+        bool dup = false, projected = false;
+
+        for (k = 0; k < ix.n_eq; k++)
+            if (pg_strcasecmp(ix.eq[k], ix.sort[i].name) == 0) { dup = true; break; }
+        if (dup)
+            continue;
+        for (k = 0; k < pos; k++)
+            if (pg_strcasecmp(recs[k].name, ix.sort[i].name) == 0) { projected = true; break; }
+        if (!projected)
+            continue;
+        if (c++ > 0)
+            appendStringInfoString(idxcols, ", ");
+        appendStringInfoString(idxcols, quote_identifier(ix.sort[i].name));
+        if (ix.sort[i].desc)
+            appendStringInfoString(idxcols, " DESC");
+    }
+
+    return true;
+}
+
+/*
+ * Build the col_map for a single-table IMMV by matching the IMMV's columns to
+ * the base table's columns by name (pg_ivm may add trailing "__ivm_*" hidden
+ * columns, which do not match any base name and are ignored).  Works whether
+ * the IMMV was just created or already existed on disk.
+ *
+ * col_map[src_attno] = mv_attno for each shared column.  *has_map is set false
+ * only for a true identity full mirror (every base column present, same
+ * positions) so that case keeps the cheap no-remap rewrite path; any projection
+ * or reordering sets it true.
+ */
+static void
+tm_build_single_colmap(const char *mv_name, const char *tbl,
+                       int col_map[64], bool *has_map)
+{
+    Oid   argt[2] = {TEXTOID, TEXTOID};
+    Datum argv[2];
+    int   ret, i, nmapped = 0, base_natts = -1;
+    bool  identity = true;
+
+    memset(col_map, 0, sizeof(int) * 64);
+    *has_map = false;
+
+    argv[0] = CStringGetTextDatum(mv_name);
+    argv[1] = CStringGetTextDatum(tbl);
+    ret = SPI_execute_with_args(
+            "WITH base AS ("
+            "  SELECT attnum::int AS n, attname FROM pg_attribute"
+            "  WHERE attrelid = ('public.' || quote_ident($2))::regclass"
+            "    AND attnum > 0 AND NOT attisdropped)"
+            " SELECT mv.attnum::int AS mv_n, base.n AS src_n,"
+            "        (SELECT count(*)::int FROM base) AS base_natts"
+            " FROM pg_attribute mv JOIN base ON base.attname = mv.attname"
+            " WHERE mv.attrelid = ('public.' || quote_ident($1))::regclass"
+            "   AND mv.attnum > 0 AND NOT mv.attisdropped"
+            " ORDER BY mv.attnum",
+            2, argt, argv, " ", true, 0);
+    if (ret != SPI_OK_SELECT || SPI_processed == 0)
+        return;
+
+    for (i = 0; i < (int) SPI_processed; i++)
+    {
+        bool isn;
+        int  mv_n  = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+                                    SPI_tuptable->tupdesc, 1, &isn));
+        int  src_n = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+                                    SPI_tuptable->tupdesc, 2, &isn));
+        base_natts = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+                                    SPI_tuptable->tupdesc, 3, &isn));
+
+        if (src_n < 64)
+        {
+            col_map[src_n] = mv_n;
+            nmapped++;
+            if (mv_n != src_n)
+                identity = false;
+        }
+        else
+            identity = false;   /* base attno we cannot map */
+    }
+
+    /* Identity full mirror (same columns, same positions) needs no remap. */
+    *has_map = !(identity && nmapped == base_natts);
+}
+
 /*
  * do_select_and_create_mvs — inner MV selection and creation logic.
  *
@@ -2509,23 +3037,29 @@ do_select_and_create_mvs(void)
         "    lower((regexp_match(query,"
         "      'FROM[[:space:]]+\"?([[:alpha:]_][[:alnum:]_]*)\"?',"
         "      'i'))[1]) AS tbl,"
+        "    query AS qtext,"
         "    " HEURISTIC_SCORE_EXPR " AS score"
         "  FROM pg_stat_statements"
         "  WHERE upper(ltrim(query)) LIKE 'SELECT%%'"
         "    AND calls          >= %d"
         "    AND mean_exec_time >= %.4f"
+        "), per_tbl AS ("
+        "  SELECT DISTINCT ON (tbl) tbl, qtext, score"
+        "  FROM ranked"
+        "  WHERE tbl IS NOT NULL"
+        "    AND tbl NOT LIKE 'pg_%%'"
+        "  ORDER BY tbl, score DESC"
         ")"
-        " SELECT tbl, max(score) AS best_score"
-        " FROM ranked"
-        " WHERE tbl IS NOT NULL"
-        "   AND tbl NOT LIKE 'pg_%%'"
-        " GROUP BY tbl"
-        " ORDER BY best_score DESC"
+        " SELECT tbl, qtext"
+        " FROM per_tbl"
+        " ORDER BY score DESC"
         " LIMIT %d";
 
     char  heuristic_sql[1024];
     /* Copied out before Phase 2 SPI calls overwrite SPI_tuptable. */
     char  candidates[MV_REGISTRY_MAX][NAMEDATALEN];
+    /* The candidate's hottest query text — drives column-subset projection. */
+    char  cand_query[MV_REGISTRY_MAX][QUERY_LEN];
     int   num_candidates = 0;
     int   created = 0;
     int   ret;
@@ -2556,7 +3090,7 @@ do_select_and_create_mvs(void)
              heuristic_min_exec_ms,
              max_mv_count);
 
-    /* ---- Phase 1: collect candidate table names ---- */
+    /* ---- Phase 1: collect candidate table names + their hottest query ---- */
     ret = SPI_execute(heuristic_sql, true, max_mv_count);
     if (ret == SPI_OK_SELECT && SPI_processed > 0)
     {
@@ -2567,9 +3101,23 @@ do_select_and_create_mvs(void)
             bool  isnull;
             Datum d = SPI_getbinval(SPI_tuptable->vals[i],
                                     SPI_tuptable->tupdesc, 1, &isnull);
-            if (!isnull)
-                strlcpy(candidates[num_candidates++],
-                        TextDatumGetCString(d), NAMEDATALEN);
+            Datum q;
+            bool  qnull;
+
+            if (isnull)
+                continue;
+            strlcpy(candidates[num_candidates],
+                    TextDatumGetCString(d), NAMEDATALEN);
+
+            q = SPI_getbinval(SPI_tuptable->vals[i],
+                              SPI_tuptable->tupdesc, 2, &qnull);
+            if (!qnull)
+                strlcpy(cand_query[num_candidates],
+                        TextDatumGetCString(q), QUERY_LEN);
+            else
+                cand_query[num_candidates][0] = '\0';
+
+            num_candidates++;
         }
     }
 
@@ -2583,6 +3131,9 @@ do_select_and_create_mvs(void)
         int         j;
         Oid         arg_types[2];
         Datum       arg_values[2];
+        int         colmap_local[64];
+        bool        has_colmap = false;
+        bool        colmap_built = false;
 
         /* Reject anything that looks like a system catalog */
         if (strncmp(tbl, "pg_", 3) == 0)
@@ -2643,6 +3194,11 @@ do_select_and_create_mvs(void)
 
         if (!immv_exists)
         {
+            StringInfoData proj, idxcols, def;
+            ProjCol        recs[TM_MAX_PROJ_COLS];
+            int            nrecs = 0;
+            bool           did_project = false;
+
             /* Verify the source table actually exists in public schema */
             arg_values[0] = CStringGetTextDatum(tbl);
             ret = SPI_execute_with_args(
@@ -2659,22 +3215,61 @@ do_select_and_create_mvs(void)
             }
 
             /*
-             * Create the IMMV via pg_ivm.  format('%I', ...) safely quotes
-             * identifiers to prevent SQL injection.
+             * Plan a column subset from the candidate's hottest query.  The
+             * raw_parser call can throw on truncated/odd text, so run it inside
+             * a subtransaction; on any failure we fall back to a full mirror.
+             */
+            initStringInfo(&proj);
+            initStringInfo(&idxcols);
+
+            if (cand_query[i][0] != '\0')
+            {
+                MemoryContext old = CurrentMemoryContext;
+
+                BeginInternalSubTransaction(NULL);
+                MemoryContextSwitchTo(old);
+                PG_TRY();
+                {
+                    did_project = tm_plan_single_projection(tbl, cand_query[i],
+                                                            &proj, recs, &nrecs,
+                                                            &idxcols);
+                    ReleaseCurrentSubTransaction();
+                    MemoryContextSwitchTo(old);
+                }
+                PG_CATCH();
+                {
+                    MemoryContextSwitchTo(old);
+                    FlushErrorState();
+                    RollbackAndReleaseCurrentSubTransaction();
+                    MemoryContextSwitchTo(old);
+                    did_project = false;
+                }
+                PG_END_TRY();
+            }
+
+            /*
+             * Create the IMMV via pg_ivm.  format('%I', ...) safely quotes the
+             * IMMV name; the projection column list and FROM target are built
+             * from quote_identifier() output so they are injection-safe too.
              *
              * create_immv() populates the view immediately and installs
              * triggers on the source table that keep it incrementally
              * up-to-date on every INSERT/UPDATE/DELETE — no REFRESH needed.
              */
+            initStringInfo(&def);
+            if (did_project)
+                appendStringInfo(&def, "SELECT %s FROM public.%s",
+                                 proj.data, quote_identifier(tbl));
+            else
+                appendStringInfo(&def, "SELECT * FROM public.%s",
+                                 quote_identifier(tbl));
+
             arg_types[0]  = TEXTOID;
             arg_types[1]  = TEXTOID;
             arg_values[0] = CStringGetTextDatum(mv_name);
-            arg_values[1] = CStringGetTextDatum(tbl);
+            arg_values[1] = CStringGetTextDatum(def.data);
             ret = SPI_execute_with_args(
-                    "SELECT pgivm.create_immv("
-                    "  format('public.%I', $1),"
-                    "  format('SELECT * FROM public.%I', $2)"
-                    ")",
+                    "SELECT pgivm.create_immv(format('public.%I', $1), $2)",
                     2, arg_types, arg_values, "  ", false, 0);
 
             if (ret < 0)
@@ -2687,10 +3282,88 @@ do_select_and_create_mvs(void)
             }
 
             ereport(LOG,
-                    (errmsg("table_materializer: created IMMV "
+                    (errmsg("table_materializer: created %s IMMV "
                             "public.%s for table public.%s",
+                            did_project ? "column-subset" : "full-mirror",
                             mv_name, tbl)));
+
+            /*
+             * Covering index on the predicate/sort columns so the IMMV answers
+             * "WHERE x = ? ORDER BY y LIMIT n" with an index scan rather than a
+             * sequential scan + sort.  pg_ivm IMMVs are plain tables, so the
+             * index is maintained automatically by the maintenance triggers.
+             */
+            if (did_project && idxcols.len > 0)
+            {
+                StringInfoData isql;
+                char           idxname[NAMEDATALEN + 24];
+
+                snprintf(idxname, sizeof(idxname), "%s_cov_idx", mv_name);
+                initStringInfo(&isql);
+                appendStringInfo(&isql,
+                                 "CREATE INDEX IF NOT EXISTS %s ON public.%s (%s)",
+                                 quote_identifier(idxname),
+                                 quote_identifier(mv_name), idxcols.data);
+
+                if (SPI_execute(isql.data, false, 0) < 0)
+                    ereport(LOG,
+                            (errmsg("table_materializer: covering index on "
+                                    "public.%s failed, continuing without it",
+                                    mv_name)));
+                else
+                    ereport(DEBUG1,
+                            (errmsg("table_materializer: built covering index "
+                                    "%s (%s)", idxname, idxcols.data)));
+            }
+
+            /*
+             * Build the col_map for the just-created projection via get_attnum
+             * (syscache), NOT an MVCC heap scan of pg_attribute: the IMMV was
+             * created in this same transaction, so a heap scan under the active
+             * snapshot may not see its catalog rows yet and would yield an empty
+             * map — which would then be mis-registered as a full mirror and
+             * crash the planner with un-remapped base attnos.  The syscache is
+             * command-counter-consistent and sees the new columns immediately.
+             */
+            if (did_project)
+            {
+                RangeVar mvrv;
+                Oid      mv_oid;
+                int      r;
+
+                memset(colmap_local, 0, sizeof(colmap_local));
+                memset(&mvrv, 0, sizeof(mvrv));
+                mvrv.type           = T_RangeVar;
+                mvrv.schemaname     = "public";
+                mvrv.relname        = mv_name;
+                mvrv.inh            = false;
+                mvrv.relpersistence = RELPERSISTENCE_PERMANENT;
+                mvrv.location       = -1;
+                mv_oid = RangeVarGetRelid(&mvrv, NoLock, true);
+
+                if (OidIsValid(mv_oid))
+                {
+                    for (r = 0; r < nrecs; r++)
+                    {
+                        AttrNumber mva = get_attnum(mv_oid, recs[r].name);
+
+                        if (AttributeNumberIsValid(mva) && recs[r].src_attno < 64)
+                            colmap_local[recs[r].src_attno] = (int) mva;
+                    }
+                    has_colmap   = true;
+                    colmap_built = true;
+                }
+            }
         }
+
+        /*
+         * For a full-mirror create or a pre-existing IMMV (committed catalog),
+         * derive the col_map from the IMMV's actual columns.  A projection sets
+         * has_colmap = true; a true identity full mirror leaves it false to keep
+         * the cheap no-remap rewrite path.
+         */
+        if (!colmap_built)
+            tm_build_single_colmap(mv_name, tbl, colmap_local, &has_colmap);
 
         /* Add the (new or pre-existing) IMMV to the shared registry */
         LWLockAcquire(&top_queries_locks[1].lock, LW_EXCLUSIVE);
@@ -2707,7 +3380,10 @@ do_select_and_create_mvs(void)
                     sizeof(entry->source_tables[0].schema));
             strlcpy(entry->source_tables[0].name, tbl,
                     sizeof(entry->source_tables[0].name));
-            entry->has_col_map = false;
+            entry->has_col_map = has_colmap;
+            if (has_colmap)
+                memcpy(entry->col_map[0], colmap_local,
+                       sizeof(entry->col_map[0]));
             mv_registry_state->num_entries++;
             created++;
 

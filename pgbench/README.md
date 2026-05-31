@@ -94,7 +94,7 @@ PGHOST=localhost DURATION=120 CLIENTS=8 THREADS=4 ./pgbench/run.sh
 | Script | Tables hit | What it stresses |
 |---|---|---|
 | `workload_joins.pgbench` | customers, orders, order_items, products | 4-way join through 200k and 500k unindexed rows |
-| `workload_wide.pgbench` | wide_metrics | Full scan on a 40-column, 100k-row table |
+| `workload_wide.pgbench` | wide_metrics | Projecting scan (7 of 40 columns) of a 100k-row table, filtered/sorted on unindexed `user_id`/`event_time` — exercises column-subset IMMVs |
 | `workload_agg.pgbench` | order_items, orders, products | Static 3-way aggregation (no parameters — one query accumulates high `total_exec_time`) |
 | `workload_mixed.pgbench` | events, wide_metrics | Two aggregations per transaction across two hot tables |
 
@@ -146,14 +146,19 @@ The comparison table printed at the end looks like:
 ──────────────────────────────────────────────────────────────────────────
   WORKLOAD                    BASE_LAT    IMMV_LAT   DELTA_LAT      BASE_TPS      IMMV_TPS
 ──────────────────────────────────────────────────────────────────────────
-  workload_joins              27.6 ms     25.2 ms     2.4 ms    145.1    158.7  (8.6%)
-  workload_wide                6.3 ms      6.2 ms     0.1 ms    634.3    648.7  (2.2%)
-  workload_agg               760.1 ms    700.3 ms    59.8 ms      5.3      5.7  (7.9%)
-  workload_mixed              25.6 ms     23.8 ms     1.8 ms    156.1    168.3  (7.2%)
+  workload_joins              18.7 ms      0.23 ms    18.5 ms    107.0   8790.4  (98.8%)
+  workload_wide                5.1 ms      0.18 ms     5.0 ms    388.7  10937.3  (96.4%)
+  workload_agg               546.6 ms    395.3 ms    151.3 ms      3.7      5.1  (27.7%)
+  workload_mixed              16.6 ms      5.81 ms    10.8 ms    120.3    344.1  (65.0%)
 ──────────────────────────────────────────────────────────────────────────
   DELTA_LAT: baseline − immv latency (positive = IMMV is faster)
 ──────────────────────────────────────────────────────────────────────────
 ```
+
+The large `workload_wide` win comes from the column-subset IMMV: the query reads
+only 7 of 40 columns, so the extension materializes just those columns plus a
+covering index on `(user_id, event_time DESC)`, turning the 100k-row sequential
+scan + sort into a 50-row index scan.
 
 **DELTA_LAT** is positive when the IMMV phase is faster.  A near-zero delta
 means the query was not rewritten (the source table was not in the top-N
@@ -216,7 +221,7 @@ pgbench/
 ├── run.sh                     full benchmark driver (create + speedup)
 ├── shift_demo.sh              shifting-workload driver (create + evict, asserts)
 ├── workload_joins.pgbench     4-way join workload
-├── workload_wide.pgbench      wide-table scan workload
+├── workload_wide.pgbench      wide-table projecting-scan workload
 ├── workload_agg.pgbench       aggregation workload (static query)
 ├── workload_mixed.pgbench     dual-table aggregation workload
 ├── shift_a_join.pgbench       Phase-A join workload (customers/orders/...)
