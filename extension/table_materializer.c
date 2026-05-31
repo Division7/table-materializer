@@ -2606,16 +2606,13 @@ tm_try_displace(double cand_score)
  *
  * For a hot single-table query we materialize only the columns the query
  * actually touches (target list + WHERE + ORDER BY + GROUP BY + HAVING) rather
- * than mirroring the whole — possibly very wide — row, and we add a covering
- * index on the equality-predicate and ORDER BY columns.  The narrow subset is
- * far cheaper to scan and to keep incrementally maintained, and the index turns
- * a "WHERE x = ? ORDER BY y LIMIT n" sequential-scan-plus-sort into an index
- * scan.  Queries that reference a column outside the subset fail the rewrite's
- * fail-closed col_map check and simply read the base table.
+ * than mirroring the whole — possibly very wide — row.  The narrow subset is
+ * far cheaper to scan and to keep incrementally maintained.  Queries that
+ * reference a column outside the subset fail the rewrite's fail-closed col_map
+ * check and simply read the base table.
  * ================================================================ */
 
 #define TM_MAX_PROJ_COLS 63    /* col_map src_attno index must stay < 64 */
-#define TM_MAX_SORT_COLS 8
 
 /* One projected output column and the base-table attno it came from. */
 typedef struct
@@ -2632,15 +2629,6 @@ typedef struct
     bool has_star;     /* a "*" / "t.*" reference — cannot project */
     bool overflow;     /* more distinct columns than we can track  */
 } ColRefSet;
-
-/* Equality-predicate and ORDER BY columns that drive the covering index. */
-typedef struct
-{
-    char eq[TM_MAX_PROJ_COLS][NAMEDATALEN];
-    int  n_eq;
-    struct { char name[NAMEDATALEN]; bool desc; } sort[TM_MAX_SORT_COLS];
-    int  n_sort;
-} IndexSpec;
 
 /*
  * Extract a bare column name from a raw ColumnRef.  Returns false (and sets
@@ -2706,86 +2694,6 @@ tm_collect_colrefs_walker(Node *node, void *context)
     return raw_expression_tree_walker(node, tm_collect_colrefs_walker, context);
 }
 
-static void
-tm_add_eq_col(IndexSpec *ix, const char *name)
-{
-    int i;
-
-    for (i = 0; i < ix->n_eq; i++)
-        if (pg_strcasecmp(ix->eq[i], name) == 0)
-            return;
-    if (ix->n_eq < TM_MAX_PROJ_COLS)
-        strlcpy(ix->eq[ix->n_eq++], name, NAMEDATALEN);
-}
-
-/*
- * Walk a raw WHERE clause collecting columns that appear on one side of a
- * "col = <non-column>" equality (the useful leading index columns).  Only AND
- * conjuncts are descended into; OR branches are skipped (an index on them would
- * not be guaranteed usable).
- */
-static void
-tm_collect_eq_cols(Node *node, IndexSpec *ix)
-{
-    if (node == NULL)
-        return;
-
-    if (IsA(node, BoolExpr))
-    {
-        BoolExpr *b = (BoolExpr *) node;
-        ListCell *lc;
-
-        if (b->boolop == AND_EXPR)
-            foreach(lc, b->args)
-                tm_collect_eq_cols((Node *) lfirst(lc), ix);
-        return;
-    }
-
-    if (IsA(node, A_Expr))
-    {
-        A_Expr *ae = (A_Expr *) node;
-        char    nm[NAMEDATALEN];
-        bool    star;
-
-        if (ae->kind != AEXPR_OP || list_length(ae->name) != 1 ||
-            strcmp(strVal(linitial(ae->name)), "=") != 0)
-            return;
-
-        if (ae->lexpr && IsA(ae->lexpr, ColumnRef) &&
-            !(ae->rexpr && IsA(ae->rexpr, ColumnRef)) &&
-            tm_colref_name((ColumnRef *) ae->lexpr, nm, sizeof(nm), &star) && !star)
-            tm_add_eq_col(ix, nm);
-        else if (ae->rexpr && IsA(ae->rexpr, ColumnRef) &&
-                 !(ae->lexpr && IsA(ae->lexpr, ColumnRef)) &&
-                 tm_colref_name((ColumnRef *) ae->rexpr, nm, sizeof(nm), &star) && !star)
-            tm_add_eq_col(ix, nm);
-    }
-}
-
-/* Collect ORDER BY columns (with direction) for the covering index. */
-static void
-tm_collect_sort_cols(List *sortClause, IndexSpec *ix)
-{
-    ListCell *lc;
-
-    foreach(lc, sortClause)
-    {
-        SortBy *sb = lfirst_node(SortBy, lc);
-        char    nm[NAMEDATALEN];
-        bool    star;
-
-        if (sb->node && IsA(sb->node, ColumnRef) &&
-            tm_colref_name((ColumnRef *) sb->node, nm, sizeof(nm), &star) && !star)
-        {
-            if (ix->n_sort >= TM_MAX_SORT_COLS)
-                return;
-            strlcpy(ix->sort[ix->n_sort].name, nm, NAMEDATALEN);
-            ix->sort[ix->n_sort].desc = (sb->sortby_dir == SORTBY_DESC);
-            ix->n_sort++;
-        }
-    }
-}
-
 /*
  * Plan a column-subset IMMV for single-table candidate `tbl` from its hottest
  * query text `query_text` (normalized text straight out of pg_stat_statements).
@@ -2793,7 +2701,6 @@ tm_collect_sort_cols(List *sortClause, IndexSpec *ix)
  * On success returns true and fills:
  *   proj    — comma-separated, quoted projection column list (attno order)
  *   recs    — (src_attno, name) for each projected column; *nrecs set
- *   idxcols — comma-separated covering-index column list (may be empty)
  *
  * Returns false — caller falls back to a full "SELECT *" mirror — when the
  * query is not a simple single-table SELECT on `tbl`, uses "*"/whole-row refs,
@@ -2805,22 +2712,19 @@ tm_collect_sort_cols(List *sortClause, IndexSpec *ix)
  */
 static bool
 tm_plan_single_projection(const char *tbl, const char *query_text,
-                          StringInfo proj, ProjCol *recs, int *nrecs,
-                          StringInfo idxcols)
+                          StringInfo proj, ProjCol *recs, int *nrecs)
 {
     List       *pl;
     RawStmt    *rs;
     SelectStmt *sel;
     RangeVar   *rv;
     ColRefSet   set;
-    IndexSpec   ix;
     Oid         argt[1];
     Datum       argv[1];
-    int         ret, i, c;
+    int         ret, i;
     int         pos = 0;
 
     memset(&set, 0, sizeof(set));
-    memset(&ix, 0, sizeof(ix));
     *nrecs = 0;
 
     pl = raw_parser(query_text, RAW_PARSE_DEFAULT);
@@ -2860,9 +2764,6 @@ tm_plan_single_projection(const char *tbl, const char *query_text,
 
     if (set.has_star || set.overflow || set.n == 0)
         return false;
-
-    tm_collect_eq_cols(sel->whereClause, &ix);
-    tm_collect_sort_cols(sel->sortClause, &ix);
 
     /* Resolve referenced names to live base-table attnos, in attno order. */
     argt[0] = TEXTOID;
@@ -2909,42 +2810,6 @@ tm_plan_single_projection(const char *tbl, const char *query_text,
     if (pos == 0)
         return false;
     *nrecs = pos;
-
-    /* Covering-index columns: equality columns first (leading, ASC), then
-     * ORDER BY columns (with direction).  Only projected columns are eligible. */
-    c = 0;
-    for (i = 0; i < ix.n_eq; i++)
-    {
-        int  k;
-        bool projected = false;
-
-        for (k = 0; k < pos; k++)
-            if (pg_strcasecmp(recs[k].name, ix.eq[i]) == 0) { projected = true; break; }
-        if (!projected)
-            continue;
-        if (c++ > 0)
-            appendStringInfoString(idxcols, ", ");
-        appendStringInfoString(idxcols, quote_identifier(ix.eq[i]));
-    }
-    for (i = 0; i < ix.n_sort; i++)
-    {
-        int  k;
-        bool dup = false, projected = false;
-
-        for (k = 0; k < ix.n_eq; k++)
-            if (pg_strcasecmp(ix.eq[k], ix.sort[i].name) == 0) { dup = true; break; }
-        if (dup)
-            continue;
-        for (k = 0; k < pos; k++)
-            if (pg_strcasecmp(recs[k].name, ix.sort[i].name) == 0) { projected = true; break; }
-        if (!projected)
-            continue;
-        if (c++ > 0)
-            appendStringInfoString(idxcols, ", ");
-        appendStringInfoString(idxcols, quote_identifier(ix.sort[i].name));
-        if (ix.sort[i].desc)
-            appendStringInfoString(idxcols, " DESC");
-    }
 
     return true;
 }
@@ -3194,7 +3059,7 @@ do_select_and_create_mvs(void)
 
         if (!immv_exists)
         {
-            StringInfoData proj, idxcols, def;
+            StringInfoData proj, def;
             ProjCol        recs[TM_MAX_PROJ_COLS];
             int            nrecs = 0;
             bool           did_project = false;
@@ -3220,7 +3085,6 @@ do_select_and_create_mvs(void)
              * a subtransaction; on any failure we fall back to a full mirror.
              */
             initStringInfo(&proj);
-            initStringInfo(&idxcols);
 
             if (cand_query[i][0] != '\0')
             {
@@ -3231,8 +3095,7 @@ do_select_and_create_mvs(void)
                 PG_TRY();
                 {
                     did_project = tm_plan_single_projection(tbl, cand_query[i],
-                                                            &proj, recs, &nrecs,
-                                                            &idxcols);
+                                                            &proj, recs, &nrecs);
                     ReleaseCurrentSubTransaction();
                     MemoryContextSwitchTo(old);
                 }
@@ -3286,35 +3149,6 @@ do_select_and_create_mvs(void)
                             "public.%s for table public.%s",
                             did_project ? "column-subset" : "full-mirror",
                             mv_name, tbl)));
-
-            /*
-             * Covering index on the predicate/sort columns so the IMMV answers
-             * "WHERE x = ? ORDER BY y LIMIT n" with an index scan rather than a
-             * sequential scan + sort.  pg_ivm IMMVs are plain tables, so the
-             * index is maintained automatically by the maintenance triggers.
-             */
-            if (did_project && idxcols.len > 0)
-            {
-                StringInfoData isql;
-                char           idxname[NAMEDATALEN + 24];
-
-                snprintf(idxname, sizeof(idxname), "%s_cov_idx", mv_name);
-                initStringInfo(&isql);
-                appendStringInfo(&isql,
-                                 "CREATE INDEX IF NOT EXISTS %s ON public.%s (%s)",
-                                 quote_identifier(idxname),
-                                 quote_identifier(mv_name), idxcols.data);
-
-                if (SPI_execute(isql.data, false, 0) < 0)
-                    ereport(LOG,
-                            (errmsg("table_materializer: covering index on "
-                                    "public.%s failed, continuing without it",
-                                    mv_name)));
-                else
-                    ereport(DEBUG1,
-                            (errmsg("table_materializer: built covering index "
-                                    "%s (%s)", idxname, idxcols.data)));
-            }
 
             /*
              * Build the col_map for the just-created projection via get_attnum
