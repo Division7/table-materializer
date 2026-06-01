@@ -1,0 +1,31 @@
+-- shift_a_join.pgbench  —  PHASE A workload
+-- 4-way join across {customers, orders, order_items, products}.
+-- orders.customer_id and order_items.order_id are unindexed, forcing seq scans
+-- through 200k and 500k rows.  This is the only hot workload in Phase A, so the
+-- worker materializes a pre-joined IMMV over these four tables (and a
+-- single-table mirror of the join root, customers).  None of these tables are
+-- touched in Phase B, so they go cold and their IMMVs are later evicted.
+\set customer_id random(1, 50000)
+
+SELECT
+    c.id          AS customer_id,
+    c.name,
+    c.region,
+    c.tier,
+    o.id          AS order_id,
+    o.created_at,
+    o.status,
+    o.total,
+    oi.qty,
+    oi.unit_price,
+    p.sku,
+    p.name        AS product_name,
+    p.category,
+    p.price
+FROM customers c
+JOIN orders o       ON o.customer_id  = c.id
+JOIN order_items oi ON oi.order_id    = o.id
+JOIN products p     ON p.id           = oi.product_id
+WHERE c.id = :customer_id
+ORDER BY o.created_at DESC
+LIMIT 25;

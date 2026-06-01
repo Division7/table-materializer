@@ -1,10 +1,13 @@
 -- workload_wide.pgbench
--- Full SELECT * on a 40-column table filtered by unindexed user_id.
--- Each execution scans all 100k rows of wide_metrics; the wide rows
--- (40 columns) amplify I/O pressure compared with narrow tables.
+-- Projecting SELECT on a 40-column table filtered by unindexed user_id.
+-- The query reads only 7 of the 40 columns; the extension can therefore
+-- materialize a *column subset* IMMV (plus a covering index on the
+-- user_id / event_time predicate+sort) instead of mirroring the whole
+-- wide row.  The narrow subset is far cheaper to scan and to keep
+-- incrementally maintained than a full-width mirror.
 \set user_id random(1, 50000)
 
-SELECT *
+SELECT id, user_id, event_time, m01, m02, cat_a, score_a
 FROM wide_metrics
 WHERE user_id = :user_id
 ORDER BY event_time DESC

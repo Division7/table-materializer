@@ -1,0 +1,12 @@
+-- shift_b_wide.pgbench  —  PHASE B workload
+-- Full SELECT * over the 40-column, 100k-row wide_metrics table filtered by an
+-- unindexed user_id.  The wide rows amplify I/O so the query is slow enough to
+-- qualify; the worker materializes wide_metrics_auto_mv.  `wide_metrics` is
+-- never touched in Phase A.
+\set user_id random(1, 50000)
+
+SELECT *
+FROM wide_metrics
+WHERE user_id = :user_id
+ORDER BY event_time DESC
+LIMIT 50;

@@ -142,3 +142,69 @@ Or just tear down the whole stack:
 ```bash
 docker compose down -v   # -v also removes the postgres-data volume
 ```
+
+---
+
+## Demonstrating a shifting workload
+
+The benchmark above shows IMMVs being *created*. The extension can also let the
+selected set **track a changing workload over time** — dropping IMMVs for tables
+that have gone cold and creating them for newly-hot tables — so the materialized
+set follows where the queries actually are.
+
+This is driven by a per-table exponentially-weighted moving average (EWMA) of
+recent query **volume** (call rate): tables that stop being queried decay toward
+zero and their IMMVs are evicted, while newly-hot tables are materialized in
+their place. Volume is used rather than execution time on purpose — once a table
+is materialized its queries get faster, so an exec-time score would collapse and
+wrongly evict the very IMMV that sped it up.
+
+### One-command demo
+
+```bash
+docker compose up -d                                    # start db
+docker compose --profile shift run --rm shift           # run the shift demo
+```
+
+The `shift` service runs the **live** background worker on a short interval and:
+
+1. **Phase A** — hammers a 4-way join over `{customers, orders, order_items,
+   products}`; the worker materializes a pre-joined IMMV (plus a mirror of the
+   join root). It then prints **Snapshot 1**.
+2. **Phase B** — stops touching those tables and instead hammers `{events,
+   wide_metrics}`. The worker materializes IMMVs for the new hot tables, and the
+   now-idle Phase-A IMMVs decay and are **dropped**. It prints **Snapshot 2**.
+3. **Asserts** the selected set shifted from the A-tables to the B-tables and
+   exits non-zero if it did not (prints `PASS`/`FAIL`).
+
+Tune it inline (defaults shown):
+
+```bash
+DURATION=60 CLIENTS=8 INTERVAL_MS=2000 MAX_MV=5 \
+  docker compose --profile shift run --rm shift
+```
+
+`MAX_MV=1` forces the budget so a Phase-B table must **displace** the Phase-A
+IMMV (exercising the displacement path as well as the decay path).
+
+> Run on a fresh database for the cleanest result. The in-memory MV registry
+> lives in shared memory, so to re-run from a pristine state without leftover
+> state from a previous demo, `docker compose restart db` first.
+
+Inspect the live registry at any time, including each entry's recent-activity
+score and how many consecutive cold ticks it has accrued:
+
+```sql
+SELECT * FROM table_materializer_list_mvs();
+```
+
+### Tuning the shift behavior
+
+These GUCs (all `SIGHUP`-reloadable) control how aggressively the set shifts:
+
+| GUC | Default | Notes |
+|-----|---------|-------|
+| `table_materializer.score_decay_alpha`  | `0.5` | EWMA weight on the newest per-tick activity delta. Higher reacts faster to shifts (shorter memory); lower is smoother. |
+| `table_materializer.evict_grace_ticks`  | `3`   | Consecutive cold ticks before a cold IMMV is dropped (hysteresis against bursty workloads). |
+| `table_materializer.evict_score_frac`   | `0.2` | "Cold" = current score below this fraction of the IMMV's peak score. |
+| `table_materializer.max_materialized_views` | `5` | Budget cap; a hotter table can displace the weakest incumbent when full. |

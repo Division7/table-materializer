@@ -94,7 +94,7 @@ PGHOST=localhost DURATION=120 CLIENTS=8 THREADS=4 ./pgbench/run.sh
 | Script | Tables hit | What it stresses |
 |---|---|---|
 | `workload_joins.pgbench` | customers, orders, order_items, products | 4-way join through 200k and 500k unindexed rows |
-| `workload_wide.pgbench` | wide_metrics | Full scan on a 40-column, 100k-row table |
+| `workload_wide.pgbench` | wide_metrics | Projecting scan (7 of 40 columns) of a 100k-row table, filtered/sorted on unindexed `user_id`/`event_time` — exercises column-subset IMMVs |
 | `workload_agg.pgbench` | order_items, orders, products | Static 3-way aggregation (no parameters — one query accumulates high `total_exec_time`) |
 | `workload_mixed.pgbench` | events, wide_metrics | Two aggregations per transaction across two hot tables |
 
@@ -146,14 +146,21 @@ The comparison table printed at the end looks like:
 ──────────────────────────────────────────────────────────────────────────
   WORKLOAD                    BASE_LAT    IMMV_LAT   DELTA_LAT      BASE_TPS      IMMV_TPS
 ──────────────────────────────────────────────────────────────────────────
-  workload_joins              27.6 ms     25.2 ms     2.4 ms    145.1    158.7  (8.6%)
-  workload_wide                6.3 ms      6.2 ms     0.1 ms    634.3    648.7  (2.2%)
-  workload_agg               760.1 ms    700.3 ms    59.8 ms      5.3      5.7  (7.9%)
-  workload_mixed              25.6 ms     23.8 ms     1.8 ms    156.1    168.3  (7.2%)
+  workload_joins              18.7 ms      0.23 ms    18.5 ms    107.0   8790.4  (98.8%)
+  workload_wide                5.1 ms      3.6 ms      1.5 ms    388.7    551.9  (28.4%)
+  workload_agg               546.6 ms    395.3 ms    151.3 ms      3.7      5.1  (27.7%)
+  workload_mixed              16.6 ms      5.81 ms    10.8 ms    120.3    344.1  (65.0%)
 ──────────────────────────────────────────────────────────────────────────
   DELTA_LAT: baseline − immv latency (positive = IMMV is faster)
 ──────────────────────────────────────────────────────────────────────────
 ```
+
+The `workload_wide` win comes from the column-subset IMMV: the query reads only
+7 of 40 columns, so the extension materializes just those columns (~3.4× narrower
+than the base row).  The IMMV still answers the query with a sequential scan +
+sort, but over far fewer heap pages, so latency drops by roughly a quarter.  The
+extension does not build secondary indexes on the IMMV — that is left to the
+operator — so this workload does not get an index-scan speedup.
 
 **DELTA_LAT** is positive when the IMMV phase is faster.  A near-zero delta
 means the query was not rewritten (the source table was not in the top-N
@@ -166,15 +173,60 @@ no dead tuples, better page density, and a warmer buffer cache by the time
 Phase 2 starts.  Pre-aggregating or pre-filtering the IMMV query would yield
 larger gains; that is a planned extension to the heuristic.
 
+## Shifting-workload demo
+
+`run.sh` proves IMMVs are *created* and speed queries up. `shift_demo.sh` proves
+the selected set can **shift over time** — old IMMVs are dropped as their tables
+go cold and new ones are created for newly-hot tables.
+
+```bash
+docker compose up -d
+docker compose --profile shift run --rm shift     # or: ./pgbench/shift_demo.sh
+```
+
+Unlike `run.sh` (which freezes the worker for a deterministic benchmark),
+`shift_demo.sh` runs the **live** worker on a short interval (`INTERVAL_MS`,
+default 2000 ms) and lets it create *and* evict autonomously:
+
+1. **Phase A** drives `shift_a_join.pgbench` — a 4-way join over `{customers,
+   orders, order_items, products}`. The worker materializes a pre-joined IMMV
+   (and a mirror of the join root). → **Snapshot 1**
+2. **Phase B** drives `shift_b_events.pgbench` + `shift_b_wide.pgbench` —
+   `{events, wide_metrics}`. The worker materializes IMMVs for these and the
+   now-cold Phase-A IMMVs decay and are dropped. → **Snapshot 2**
+3. The script **asserts** the set shifted (A-IMMVs gone, B-IMMVs present) and
+   exits non-zero otherwise.
+
+Env knobs: `DURATION` (seconds per phase, default 45), `CLIENTS`, `THREADS`,
+`INTERVAL_MS`, `MAX_MV` (budget; `MAX_MV=1` forces the displacement path),
+`POLL_TIMEOUT`. The shift is driven by a per-table EWMA of recent query
+**volume** (call rate, which — unlike execution time — does not collapse once a
+table is materialized); the GUCs `score_decay_alpha`, `evict_grace_ticks`, and
+`evict_score_frac` tune how fast a cold table's IMMV is evicted (see the
+top-level `README.md`).
+
+Watch it live in another shell:
+
+```sql
+SELECT * FROM table_materializer_list_mvs();   -- score + cold_ticks per IMMV
+```
+
+> The MV registry lives in shared memory, so for a pristine re-run without state
+> from a previous demo, `docker compose restart db` first.
+
 ## Files
 
 ```
 pgbench/
 ├── README.md                  this file
 ├── init.sql                   schema setup, threshold overrides, cleanup
-├── run.sh                     full benchmark driver
+├── run.sh                     full benchmark driver (create + speedup)
+├── shift_demo.sh              shifting-workload driver (create + evict, asserts)
 ├── workload_joins.pgbench     4-way join workload
-├── workload_wide.pgbench      wide-table scan workload
+├── workload_wide.pgbench      wide-table projecting-scan workload
 ├── workload_agg.pgbench       aggregation workload (static query)
-└── workload_mixed.pgbench     dual-table aggregation workload
+├── workload_mixed.pgbench     dual-table aggregation workload
+├── shift_a_join.pgbench       Phase-A join workload (customers/orders/...)
+├── shift_b_events.pgbench     Phase-B events aggregation
+└── shift_b_wide.pgbench       Phase-B wide_metrics scan
 ```
