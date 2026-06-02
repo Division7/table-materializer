@@ -1,0 +1,10 @@
+-- heur_cheap.pgbench  —  the "cheap" profile for heuristic_stress.sh
+-- A primary-key point lookup per cheap table (5k rows).  Run frequently (high
+-- call count) but each call is sub-millisecond, so mean_exec_time stays below
+-- heuristic_min_exec_time_ms and the table is filtered out despite the volume.
+-- This proves the heuristic ignores cheap-but-frequent queries.
+\set k random(1, 5000)
+SELECT val FROM h_cheap_1 WHERE id = :k;
+SELECT val FROM h_cheap_2 WHERE id = :k;
+SELECT val FROM h_cheap_3 WHERE id = :k;
+SELECT val FROM h_cheap_4 WHERE id = :k;

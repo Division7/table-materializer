@@ -1,0 +1,9 @@
+-- heur_hot.pgbench  —  the "hot" profile for heuristic_stress.sh
+-- One slow GROUP BY aggregate per hot table (seq scan over 300k unindexed rows).
+-- No parameters -> identical query text every call, so pg_stat_statements
+-- accumulates a high call count and a high mean_exec_time -> high score.
+-- heuristic_stress.sh drives this script for the full DURATION (many calls).
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_hot_1 GROUP BY grp ORDER BY n DESC;
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_hot_2 GROUP BY grp ORDER BY n DESC;
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_hot_3 GROUP BY grp ORDER BY n DESC;
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_hot_4 GROUP BY grp ORDER BY n DESC;

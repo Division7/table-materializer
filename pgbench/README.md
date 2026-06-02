@@ -173,6 +173,91 @@ no dead tuples, better page density, and a warmer buffer cache by the time
 Phase 2 starts.  Pre-aggregating or pre-filtering the IMMV query would yield
 larger gains; that is a planned extension to the heuristic.
 
+## Write-overhead benchmark
+
+`run.sh` shows IMMVs make matching *reads* faster. `write_overhead.sh` shows the
+other side of the trade-off: once an IMMV mirrors a table, pg_ivm installs
+AFTER-ROW maintenance triggers, so every `INSERT` / `UPDATE` / `DELETE` on the
+base table also does work to keep the view current — **writes get slower**.
+
+```bash
+docker compose up -d
+docker compose --profile writes run --rm writes    # or: ./pgbench/write_overhead.sh
+```
+
+It runs the same write workload twice against `orders`:
+
+1. **Phase 1** — no IMMV; baseline write latency/TPS.
+2. Creates `orders_auto_mv` (`SELECT * FROM orders` — exactly what the worker
+   would build), directly via `pgivm.create_immv` so the benchmark
+   deterministically targets the written table.
+3. **Phase 2** — re-runs the writes with the IMMV present, then prints the
+   slowdown.
+
+The workload (`workload_writes.pgbench`) batches 1,500 row changes per
+transaction (500 INSERT + 500 UPDATE + 500 DELETE, net-zero growth) and runs
+**single-client by default**. Batching makes the per-row maintenance cost
+dominate the fixed commit cost so it is cleanly measurable; single-client avoids
+the lock-contention/deadlock noise that concurrent writers hit because pg_ivm
+*serializes* view maintenance. A representative result:
+
+```
+  METRIC                 NO_IMMV     WITH_IMMV
+  write latency          5.8 ms        22.4 ms
+  write TPS               173            44
+  Write throughput dropped ~74% with the IMMV present (≈3.9x slower).
+```
+
+The script also confirms the IMMV stayed in sync (`orders` row count ==
+`orders_auto_mv` row count) with no manual `REFRESH` — incremental maintenance
+kept up with the write stream. Env knobs: `DURATION`, `CLIENTS`, `THREADS`
+(raising `CLIENTS` adds a *second*, contention-driven penalty on top of the
+per-row cost).
+
+## Heuristic-selection stress test
+
+`heuristic_stress.sh` exercises the **selection quality** of the heuristic: given
+many candidate tables with very different `(calls × mean_exec_time)` profiles and
+a budget of only 4 IMMVs, does the worker pick the right ones?
+
+```bash
+docker compose up -d
+docker compose --profile heuristic run --rm heuristic   # or: ./pgbench/heuristic_stress.sh
+```
+
+`init_heuristic.sql` builds **16 tables across four profiles** that each land on
+one side of the two heuristic floors (`heuristic_min_calls=20`,
+`heuristic_min_exec_time_ms=5.0`):
+
+| Profile | Shape | Driven | Expectation |
+|---|---|---|---|
+| `h_hot_1..4` | 300k rows, slow GROUP BY | frequently (full `DURATION`) | **PICK** — high score |
+| `h_cheap_1..4` | 5k rows, PK point lookup | frequently | skip — below exec-time floor |
+| `h_rare_1..4` | 300k rows, slow GROUP BY | only `RARE_TXNS` (8) calls | skip — below calls floor |
+| `h_noise_1..4` | 500 rows, trivial COUNT(*) | only `RARE_TXNS` calls | skip — fails both floors |
+
+The script drives each profile, then prints the **candidate report** straight
+from `pg_stat_statements` — the exact `(calls, mean_ms, score, qualifies)` the
+worker ranks on:
+
+```
+ profile |    tbl    | calls  | mean_ms |  score  | qualifies
+---------+-----------+--------+---------+---------+-----------
+ hot     | h_hot_1   |    533 |   28.34 | 15103.8 | yes
+ cheap   | h_cheap_1 | 124192 |    0.01 |   743.3 | no       (too fast)
+ rare    | h_rare_1  |      8 |   21.62 |   172.9 | no       (too few calls)
+ noise   | h_noise_1 |      8 |    0.05 |     0.4 | no       (fails both)
+```
+
+It then calls `table_materializer_force_spawn()` and **asserts** the materialized
+set is exactly the 4 hot tables — no cheap/rare/noise table slipped through the
+budget. This makes it a good regression target when tuning `HEURISTIC_SCORE_EXPR`
+or the threshold GUCs. Env knobs: `DURATION`, `CLIENTS`, `THREADS`, `RARE_TXNS`.
+
+> Like the shift demo, the MV registry lives in shared memory. The test passes on
+> re-runs, but for a pristine run (and to avoid a stale-registry warning) start
+> from a fresh DB or `docker compose restart db` first.
+
 ## Shifting-workload demo
 
 `run.sh` proves IMMVs are *created* and speed queries up. `shift_demo.sh` proves
@@ -221,11 +306,19 @@ pgbench/
 ├── README.md                  this file
 ├── init.sql                   schema setup, threshold overrides, cleanup
 ├── run.sh                     full benchmark driver (create + speedup)
+├── write_overhead.sh          write-cost driver (writes are slower with an IMMV)
+├── heuristic_stress.sh        16-table selection-quality driver (asserts picks)
 ├── shift_demo.sh              shifting-workload driver (create + evict, asserts)
+├── init_heuristic.sql         16-table schema for the heuristic stress test
 ├── workload_joins.pgbench     4-way join workload
 ├── workload_wide.pgbench      wide-table projecting-scan workload
 ├── workload_agg.pgbench       aggregation workload (static query)
 ├── workload_mixed.pgbench     dual-table aggregation workload
+├── workload_writes.pgbench    batched INSERT/UPDATE/DELETE on orders
+├── heur_hot.pgbench           heuristic: frequent + slow (expect PICK)
+├── heur_cheap.pgbench         heuristic: frequent + fast (expect skip)
+├── heur_rare.pgbench          heuristic: slow + rare    (expect skip)
+├── heur_noise.pgbench         heuristic: fast + rare    (expect skip)
 ├── shift_a_join.pgbench       Phase-A join workload (customers/orders/...)
 ├── shift_b_events.pgbench     Phase-B events aggregation
 └── shift_b_wide.pgbench       Phase-B wide_metrics scan

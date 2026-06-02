@@ -1,0 +1,9 @@
+-- heur_rare.pgbench  —  the "rare" profile for heuristic_stress.sh
+-- Structurally identical to the hot aggregate (300k-row seq scan, high
+-- mean_exec_time), but heuristic_stress.sh runs it only a handful of times
+-- (pgbench -t, well below heuristic_min_calls).  A high per-call cost is NOT
+-- enough on its own: the calls floor filters out expensive-but-rare queries.
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_rare_1 GROUP BY grp ORDER BY n DESC;
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_rare_2 GROUP BY grp ORDER BY n DESC;
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_rare_3 GROUP BY grp ORDER BY n DESC;
+SELECT grp, count(*) AS n, avg(val) AS a, sum(val) AS s FROM h_rare_4 GROUP BY grp ORDER BY n DESC;

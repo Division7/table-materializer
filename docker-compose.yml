@@ -64,3 +64,44 @@ services:
     entrypoint: ["bash", "/pgbench/shift_demo.sh"]
     profiles:
       - shift
+
+  writes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      DURATION: "${DURATION:-60}"
+      CLIENTS: "${CLIENTS:-4}"
+      THREADS: "${THREADS:-2}"
+    entrypoint: ["bash", "/pgbench/write_overhead.sh"]
+    profiles:
+      - writes
+
+  heuristic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      DURATION: "${DURATION:-30}"
+      CLIENTS: "${CLIENTS:-4}"
+      THREADS: "${THREADS:-2}"
+      RARE_TXNS: "${RARE_TXNS:-8}"
+    entrypoint: ["bash", "/pgbench/heuristic_stress.sh"]
+    profiles:
+      - heuristic

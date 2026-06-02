@@ -1,0 +1,28 @@
+-- workload_writes.pgbench
+-- Batched mutating workload on `orders` — the *write* side of the IMMV trade-off.
+--
+-- Each transaction INSERTs 500 rows, UPDATEs those 500, then DELETEs them, so
+-- one transaction drives 1,500 row-level changes across all three DML paths and
+-- nets zero growth (the table stays at its ~200k starting size).
+--
+-- When an IMMV mirrors `orders`, pg_ivm installs AFTER-ROW triggers that
+-- incrementally maintain the view for every one of those 1,500 changes.  We
+-- batch the writes (rather than one row per transaction) so this per-row
+-- maintenance cost dominates the fixed per-transaction commit cost and is
+-- cleanly measurable.  write_overhead.sh runs this single-client with and
+-- without the IMMV present; the latency/TPS gap is the maintenance overhead.
+--
+-- Single-client by design: pg_ivm serializes view maintenance, so concurrent
+-- writers would add lock-contention/deadlock noise on top of the per-row cost
+-- we want to isolate here.
+\set cid random(1, 50000)
+
+BEGIN;
+INSERT INTO orders (customer_id, created_at, status, total)
+SELECT 1 + (g % 50000), now(), 'pending', (10 + random() * 9990)::numeric
+FROM generate_series(1, 500) g;
+UPDATE orders SET status = 'shipped', total = total + 1
+WHERE id IN (SELECT id FROM orders ORDER BY id DESC LIMIT 500);
+DELETE FROM orders
+WHERE id IN (SELECT id FROM orders ORDER BY id DESC LIMIT 500);
+END;

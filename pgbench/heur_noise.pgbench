@@ -1,0 +1,8 @@
+-- heur_noise.pgbench  —  the "noise" profile for heuristic_stress.sh
+-- Trivial COUNT(*) over a tiny 500-row table, run only a handful of times.
+-- Fast AND rare -> fails both heuristic thresholds.  This is the background
+-- chatter the heuristic must not waste a materialization budget slot on.
+SELECT count(*) FROM h_noise_1;
+SELECT count(*) FROM h_noise_2;
+SELECT count(*) FROM h_noise_3;
+SELECT count(*) FROM h_noise_4;

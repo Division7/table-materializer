@@ -208,3 +208,36 @@ These GUCs (all `SIGHUP`-reloadable) control how aggressively the set shifts:
 | `table_materializer.evict_grace_ticks`  | `3`   | Consecutive cold ticks before a cold IMMV is dropped (hysteresis against bursty workloads). |
 | `table_materializer.evict_score_frac`   | `0.2` | "Cold" = current score below this fraction of the IMMV's peak score. |
 | `table_materializer.max_materialized_views` | `5` | Budget cap; a hotter table can displace the weakest incumbent when full. |
+
+---
+
+## The write-side cost of IMMVs
+
+The benchmarks above measure the *read* speed-up. IMMVs are not free: pg_ivm
+installs maintenance triggers on the base table, so every `INSERT` / `UPDATE` /
+`DELETE` also updates the view. `write_overhead.sh` quantifies that cost — it
+runs a batched write workload against `orders` with and without a mirroring
+IMMV and reports the slowdown (typically ~3–4× lower write throughput).
+
+```bash
+docker compose up -d
+docker compose --profile writes run --rm writes
+```
+
+## Stress-testing the selection heuristic
+
+`heuristic_stress.sh` checks that the heuristic picks the *right* tables. It
+builds **16 tables across four workload profiles** (frequent+slow, frequent+fast,
+slow+rare, fast+rare), drives each one, prints the per-table
+`(calls, mean_ms, score, qualifies)` report straight from `pg_stat_statements`,
+then asserts the worker materialized exactly the 4 genuinely-hot tables and
+skipped the cheap, rare, and noise tables. A good regression target when tuning
+`HEURISTIC_SCORE_EXPR` or the threshold GUCs.
+
+```bash
+docker compose up -d
+docker compose --profile heuristic run --rm heuristic
+```
+
+See [`pgbench/README.md`](pgbench/README.md) for the full details, env knobs, and
+sample output of both benchmarks.
