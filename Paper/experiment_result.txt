@@ -2,6 +2,7 @@ All tests are done with Intel Ultra 9 275HX CPU and 32 GB RAM.
 
 All tests are done with DURATION=60, CLIENTS=4, THREADS=2
 
+BENCH
 
 The result for: HEURISTIC_SCORE_EXPR  "mean_exec_time * calls"
 ────────────────────────────────────────────────────────────────────────
@@ -61,4 +62,77 @@ The result for: HEURISTIC_SCORE_EXPR  "mean_exec_time * calls"
   workload_mixed              13.424 ms    13.866 ms    -0.442 ms    297.979792    288.481259  (-3.3%)
 ────────────────────────────────────────────────────────────────────────
   DELTA_LAT: baseline − immv latency (positive = IMMV is faster)
+────────────────────────────────────────────────────────────────────────
+
+
+WRITES
+
+#define HEURISTIC_SCORE_EXPR  "rows"
+────────────────────────────────────────────────────────────────────────
+  METRIC                 NO_IMMV     WITH_IMMV
+────────────────────────────────────────────────────────────────────────
+  write latency          6.612 ms      66.019 ms
+  write TPS           604.922433     15.159672
+────────────────────────────────────────────────────────────────────────
+  Write throughput dropped 97.5% with the IMMV present
+  (baseline is 39.90x the IMMV-phase TPS) — the cost of keeping
+  orders_auto_mv incrementally maintained on every write.
+────────────────────────────────────────────────────────────────────────
+  ✓ As expected, writes are slower when the IMMV exists.
+────────────────────────────────────────────────────────────────────────
+
+#define HEURISTIC_SCORE_EXPR  "total_exec_time"
+────────────────────────────────────────────────────────────────────────
+  METRIC                 NO_IMMV     WITH_IMMV
+────────────────────────────────────────────────────────────────────────
+  write latency          6.481 ms      66.085 ms
+  write TPS           617.167244     15.144428
+────────────────────────────────────────────────────────────────────────
+  Write throughput dropped 97.5% with the IMMV present
+  (baseline is 40.75x the IMMV-phase TPS) — the cost of keeping
+  orders_auto_mv incrementally maintained on every write.
+────────────────────────────────────────────────────────────────────────
+  ✓ As expected, writes are slower when the IMMV exists.
+────────────────────────────────────────────────────────────────────────
+
+#define HEURISTIC_SCORE_EXPR  "mean_exec_time"
+────────────────────────────────────────────────────────────────────────
+  METRIC                 NO_IMMV     WITH_IMMV
+────────────────────────────────────────────────────────────────────────
+  write latency          6.431 ms      65.465 ms
+  write TPS           621.946160     15.287846
+────────────────────────────────────────────────────────────────────────
+  Write throughput dropped 97.5% with the IMMV present
+  (baseline is 40.68x the IMMV-phase TPS) — the cost of keeping
+  orders_auto_mv incrementally maintained on every write.
+────────────────────────────────────────────────────────────────────────
+  ✓ As expected, writes are slower when the IMMV exists.
+────────────────────────────────────────────────────────────────────────
+
+The result for: HEURISTIC_SCORE_EXPR  "mean_exec_time * calls"
+────────────────────────────────────────────────────────────────────────
+  METRIC                 NO_IMMV     WITH_IMMV
+────────────────────────────────────────────────────────────────────────
+  write latency          6.540 ms      66.129 ms
+  write TPS           611.630745     15.134484
+────────────────────────────────────────────────────────────────────────
+  Write throughput dropped 97.5% with the IMMV present
+  (baseline is 40.41x the IMMV-phase TPS) — the cost of keeping
+  orders_auto_mv incrementally maintained on every write.
+────────────────────────────────────────────────────────────────────────
+  ✓ As expected, writes are slower when the IMMV exists.
+────────────────────────────────────────────────────────────────────────
+
+#define HEURISTIC_SCORE_EXPR  "calls"
+────────────────────────────────────────────────────────────────────────
+  METRIC                 NO_IMMV     WITH_IMMV
+────────────────────────────────────────────────────────────────────────
+  write latency          6.451 ms      64.971 ms
+  write TPS           620.023740     15.403936
+────────────────────────────────────────────────────────────────────────
+  Write throughput dropped 97.5% with the IMMV present
+  (baseline is 40.25x the IMMV-phase TPS) — the cost of keeping
+  orders_auto_mv incrementally maintained on every write.
+────────────────────────────────────────────────────────────────────────
+  ✓ As expected, writes are slower when the IMMV exists.
 ────────────────────────────────────────────────────────────────────────

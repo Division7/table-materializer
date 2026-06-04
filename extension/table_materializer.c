@@ -1518,7 +1518,7 @@ update_top_queries(void)
  * ================================================================
  */
 // #define HEURISTIC_SCORE_EXPR  "mean_exec_time * calls"
-#define HEURISTIC_SCORE_EXPR  "rows"
+#define HEURISTIC_SCORE_EXPR  "calls"
 
 /* ================================================================
  * JOIN-MV CREATION
