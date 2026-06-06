@@ -34,94 +34,87 @@ All latencies are measured in milliseconds (ms) and all throughput values are me
 
 \begin{table}[t]
 \centering
-\caption{Read performance for \texttt{workload\_joins}.}
+
 \label{tab:joins}
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrr}
 \hline
 Heuristic &
 Base Lat. &
 IMMV Lat. &
-$\Delta$ Lat. &
-Base TPS &
-IMMV TPS \\
+$\Delta$ Lat.\\
 \hline
-mean\_exec\_time $\times$ calls & 13.272 & 0.138 & 13.134 & 301.38 & 28899.82 \\
-calls                         & 14.097 & 0.137 & 13.960 & 283.76 & 29258.12 \\
-mean\_exec\_time              & 9.605  & 0.135 & 9.470  & 416.45 & 29663.21 \\
-total\_exec\_time             & 10.668 & 0.137 & 10.531 & 374.96 & 29155.13 \\
-rows                          & 13.969 & 0.137 & 13.832 & 286.34 & 29142.06 \\
+mean\_exec\_time $\times$ calls & 13.272 & 0.138 & 13.134 \\
+calls                         & 14.097 & 0.137 & 13.960 \\
+mean\_exec\_time              & 9.605  & 0.135 & 9.470  \\
+total\_exec\_time             & 10.668 & 0.137 & 10.531 \\
+rows                          & 13.969 & 0.137 & 13.832 \\
 \hline
 \end{tabular}
-\vspace{1mm}
-\begin{flushleft}
-\footnotesize $\Delta$ Lat. = Base Lat. $-$ IMMV Lat.; positive values indicate lower latency with IMMV.
-\end{flushleft}
+\caption{Read performance for \texttt{workload\_joins}.}
 \end{table}
 
 \begin{table}[t]
 \centering
-\caption{Read performance for \texttt{workload\_wide}.}
+
 \label{tab:wide}
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrr}
 \hline
 Heuristic &
 Base Lat. &
 IMMV Lat. &
-$\Delta$ Lat. &
-Base TPS &
-IMMV TPS \\
+$\Delta$ Lat.\\
 \hline
-mean\_exec\_time $\times$ calls & 3.854 & 4.414 & -0.560 & 1038.00 & 906.31 \\
-calls                         & 3.938 & 4.397 & -0.459 & 1015.69 & 909.77 \\
-mean\_exec\_time              & 4.229 & 4.288 & -0.059 & 945.77 & 932.88 \\
-total\_exec\_time             & 4.401 & 4.455 & -0.054 & 908.98 & 897.96 \\
-rows                          & 4.030 & 4.490 & -0.460 & 992.44 & 890.79 \\
+mean\_exec\_time $\times$ calls & 3.854 & 4.414 & -0.560  \\
+calls                         & 3.938 & 4.397 & -0.459  \\
+mean\_exec\_time              & 4.229 & 4.288 & -0.059 \\
+total\_exec\_time             & 4.401 & 4.455 & -0.054 \\
+rows                          & 4.030 & 4.490 & -0.460 \\
 \hline
 \end{tabular}
+\caption{Read performance for \texttt{workload\_wide}.}
+
 \end{table}
 
 \begin{table}[t]
 \centering
-\caption{Read performance for \texttt{workload\_agg}.}
+
 \label{tab:agg}
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrr}
 \hline
 Heuristic &
 Base Lat. &
 IMMV Lat. &
-$\Delta$ Lat. &
-Base TPS &
-IMMV TPS \\
+$\Delta$ Lat.\\
 \hline
-mean\_exec\_time $\times$ calls & 328.863 & 328.581 & 0.282 & 12.16 & 12.17 \\
-calls                         & 321.265 & 238.318 & 82.947 & 12.45 & 16.78 \\
-mean\_exec\_time              & 320.888 & 325.452 & -4.564 & 12.47 & 12.29 \\
-total\_exec\_time             & 321.700 & 325.541 & -3.841 & 12.43 & 12.29 \\
-rows                          & 235.607 & 239.127 & -3.520 & 16.98 & 16.73 \\
+mean\_exec\_time $\times$ calls & 328.863 & 328.581 & 0.282 \\
+calls                         & 321.265 & 238.318 & 82.947 \\
+mean\_exec\_time              & 320.888 & 325.452 & -4.564 \\
+total\_exec\_time             & 321.700 & 325.541 & -3.841 \\
+rows                          & 235.607 & 239.127 & -3.520 \\
 \hline
 \end{tabular}
+\caption{Read performance for \texttt{workload\_agg}.}
 \end{table}
 
 \begin{table}[t]
 \centering
-\caption{Read performance for \texttt{workload\_mixed}.}
+
 \label{tab:mixed}
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrr}
 \hline
 Heuristic &
 Base Lat. &
 IMMV Lat. &
-$\Delta$ Lat. &
-Base TPS &
-IMMV TPS \\
+$\Delta$ Lat. \\
 \hline
-mean\_exec\_time $\times$ calls & 13.421 & 14.265 & -0.844 & 298.04 & 280.40 \\
-calls                         & 13.255 & 13.334 & -0.079 & 301.78 & 299.97 \\
-mean\_exec\_time              & 13.302 & 10.405 & 2.897 & 300.70 & 384.44 \\
-total\_exec\_time             & 14.196 & 13.282 & 0.914 & 281.76 & 301.15 \\
-rows                          & 13.424 & 13.866 & -0.442 & 297.98 & 288.48 \\
+mean\_exec\_time $\times$ calls & 13.421 & 14.265 & -0.844 \\
+calls                         & 13.255 & 13.334 & -0.079 \\
+mean\_exec\_time              & 13.302 & 10.405 & 2.897 \\
+total\_exec\_time             & 14.196 & 13.282 & 0.914 \\
+rows                          & 13.424 & 13.866 & -0.442 \\
 \hline
 \end{tabular}
+\caption{Read performance for \texttt{workload\_mixed}.}
 \end{table}
 
 
