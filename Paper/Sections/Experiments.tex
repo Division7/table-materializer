@@ -1,1 +1,171 @@
 \section{Experiments}
+
+\subsection{Experimental Setup}
+
+We use PGBench\textcite{pgbench} as the benchmark for testing our extension. PGBench is a benchmarking and workload-generation tool that comes with the PostgreSQL database system and is commonly used to measure database performance, stress-test a PostgreSQL server, and compare different database configurations. PGBench allows us to simulate many concurrent clients, execute transactions repeatedly, and measure various performance metrics such as transaction throughput, latency, and resource utilization.
+
+For the sake of testing our extension, we curated a dataset that includes a variety of features. It consists of 50,000 customer records, 10,000 product records, 200,000 order records, 500,000 order item records, 100,000 wide-metric records, and 500,000 event records. These relations collectively emulate a realistic e-commerce and analytics environment, providing a diverse set of query patterns for evaluating automatic materialized view selection. The dataset also includes a synthetic wide table, \texttt{wide\_metrics}, designed specifically to evaluate projection-oriented materialization strategies. The table contains 100,000 rows and more than 40 attributes spanning multiple data types, including floating-point measurements, categorical attributes, text fields, Boolean flags, timestamps, and numerical scores. While typical benchmark schemas primarily focus on relational joins and aggregations, wide analytical tables are common in monitoring, logging, and business intelligence applications. This table therefore provides a realistic setting for evaluating whether the proposed extension can identify and materialize only the subset of columns frequently accessed by queries, thereby reducing storage and maintenance overhead while improving query performance. Our dataset is generated synthetically but preserves common characteristics of production workloads, including one-to-many relationships, high-cardinality attributes, aggregation-heavy event streams, and wide analytical tables.
+
+To evaluate the effectiveness of the proposed materialization strategy under different workload characteristics, we designed four representative benchmark workloads:
+
+\begin{itemize}
+
+\item \textbf{Join-Heavy Workload.}
+This workload performs a four-way join among the \texttt{customers}, \texttt{orders}, \texttt{order\_items}, and \texttt{products} tables. The schema intentionally omits indexes on selected foreign-key attributes, forcing large sequential scans and expensive join operations. This workload represents transactional queries that repeatedly reconstruct the same join results from base tables and is intended to evaluate the benefits of materializing frequently executed join patterns.
+
+\item \textbf{Aggregation-Heavy Workload.}
+This workload executes a three-way join over the \texttt{orders}, \texttt{order\_items}, and \texttt{products} tables, followed by multiple aggregate functions and a \texttt{GROUP BY} operation. The query computes category-level statistics such as revenue, units sold, average prices, and unique customer counts. Since a large amount of data is processed to produce a compact result set, this workload is particularly suitable for evaluating the effectiveness of materialized aggregations.
+
+\item \textbf{Wide-Table Scan Workload.}
+This workload targets the \texttt{wide\_metrics} relation, which contains more than forty attributes of mixed data types. Queries access only a small subset of columns while filtering and sorting on user-specific predicates. The workload evaluates whether the extension can exploit projection-based materialization by storing only frequently accessed columns instead of replicating the entire wide table.
+
+\item \textbf{Mixed Workload.}
+This workload combines analytical queries over both the \texttt{events} and \texttt{wide\_metrics} tables within the same transaction. Unlike the previous workloads, which contain a single dominant query pattern, the mixed workload presents multiple competing materialization candidates. It is therefore useful for evaluating the effectiveness of different heuristic scoring functions when selecting candidate views for materialization.
+
+\end{itemize}
+
+In addition to the read-oriented workloads above, we constructed a write-intensive benchmark to quantify the maintenance overhead introduced by our IMMV. Each transaction inserts 500 rows into the \texttt{orders} table, updates the inserted rows, and subsequently deletes them, generating 1,500 row-level modifications while keeping the overall table size stable. By comparing execution latency and throughput with and without an IMMV present, we isolate the cost of incremental view maintenance and evaluate the trade-off between improved read performance and increased write overhead.
+
+All experiments were conducted on a system equipped with an Intel Ultra 9 275HX processor and 32 GB of memory. Unless otherwise specified, each PGBench run used a duration of 60 seconds, 4 concurrent clients, and 2 worker threads. Prior to each experiment, query statistics were reset and all previously generated materialized views were removed to ensure a consistent starting state. Database statistics were refreshed using PostgreSQL's \texttt{ANALYZE} command so that the query optimizer had accurate cardinality estimates throughout the evaluation.
+
+\subsection{Results}
+
+All latencies are measured in milliseconds (ms) and all throughput values are measured in transactions per second (TPS). For each read workload, we compare the performance of the baseline configuration without any materialized views against the configuration with our proposed IMMV. We also evaluate the performance for the write workload in comparison.
+
+\begin{table}[t]
+\centering
+\caption{Read performance for \texttt{workload\_joins}.}
+\label{tab:joins}
+\begin{tabular}{lrrrrr}
+\hline
+Heuristic &
+Base Lat. &
+IMMV Lat. &
+$\Delta$ Lat. &
+Base TPS &
+IMMV TPS \\
+\hline
+mean\_exec\_time $\times$ calls & 13.272 & 0.138 & 13.134 & 301.38 & 28899.82 \\
+calls                         & 14.097 & 0.137 & 13.960 & 283.76 & 29258.12 \\
+mean\_exec\_time              & 9.605  & 0.135 & 9.470  & 416.45 & 29663.21 \\
+total\_exec\_time             & 10.668 & 0.137 & 10.531 & 374.96 & 29155.13 \\
+rows                          & 13.969 & 0.137 & 13.832 & 286.34 & 29142.06 \\
+\hline
+\end{tabular}
+\vspace{1mm}
+\begin{flushleft}
+\footnotesize $\Delta$ Lat. = Base Lat. $-$ IMMV Lat.; positive values indicate lower latency with IMMV.
+\end{flushleft}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Read performance for \texttt{workload\_wide}.}
+\label{tab:wide}
+\begin{tabular}{lrrrrr}
+\hline
+Heuristic &
+Base Lat. &
+IMMV Lat. &
+$\Delta$ Lat. &
+Base TPS &
+IMMV TPS \\
+\hline
+mean\_exec\_time $\times$ calls & 3.854 & 4.414 & -0.560 & 1038.00 & 906.31 \\
+calls                         & 3.938 & 4.397 & -0.459 & 1015.69 & 909.77 \\
+mean\_exec\_time              & 4.229 & 4.288 & -0.059 & 945.77 & 932.88 \\
+total\_exec\_time             & 4.401 & 4.455 & -0.054 & 908.98 & 897.96 \\
+rows                          & 4.030 & 4.490 & -0.460 & 992.44 & 890.79 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Read performance for \texttt{workload\_agg}.}
+\label{tab:agg}
+\begin{tabular}{lrrrrr}
+\hline
+Heuristic &
+Base Lat. &
+IMMV Lat. &
+$\Delta$ Lat. &
+Base TPS &
+IMMV TPS \\
+\hline
+mean\_exec\_time $\times$ calls & 328.863 & 328.581 & 0.282 & 12.16 & 12.17 \\
+calls                         & 321.265 & 238.318 & 82.947 & 12.45 & 16.78 \\
+mean\_exec\_time              & 320.888 & 325.452 & -4.564 & 12.47 & 12.29 \\
+total\_exec\_time             & 321.700 & 325.541 & -3.841 & 12.43 & 12.29 \\
+rows                          & 235.607 & 239.127 & -3.520 & 16.98 & 16.73 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Read performance for \texttt{workload\_mixed}.}
+\label{tab:mixed}
+\begin{tabular}{lrrrrr}
+\hline
+Heuristic &
+Base Lat. &
+IMMV Lat. &
+$\Delta$ Lat. &
+Base TPS &
+IMMV TPS \\
+\hline
+mean\_exec\_time $\times$ calls & 13.421 & 14.265 & -0.844 & 298.04 & 280.40 \\
+calls                         & 13.255 & 13.334 & -0.079 & 301.78 & 299.97 \\
+mean\_exec\_time              & 13.302 & 10.405 & 2.897 & 300.70 & 384.44 \\
+total\_exec\_time             & 14.196 & 13.282 & 0.914 & 281.76 & 301.15 \\
+rows                          & 13.424 & 13.866 & -0.442 & 297.98 & 288.48 \\
+\hline
+\end{tabular}
+\end{table}
+
+
+\begin{table*}[t]
+\centering
+\caption{Write performance with or without IMMV.}
+\label{tab:write_bench}
+\resizebox{1.25\textwidth}{!}{
+\begin{tabular}{l|cc|cc|cc|cc|cc}
+\hline
+
+& \multicolumn{2}{c|}{rows}
+& \multicolumn{2}{c|}{total\_exec\_time}
+& \multicolumn{2}{c|}{mean\_exec\_time}
+& \multicolumn{2}{c|}{mean\_exec\_time $\times$ calls}
+& \multicolumn{2}{c}{calls}
+\\
+
+Metric
+& NO\_IMMV & WITH\_IMMV
+& NO\_IMMV & WITH\_IMMV
+& NO\_IMMV & WITH\_IMMV
+& NO\_IMMV & WITH\_IMMV
+& NO\_IMMV & WITH\_IMMV
+\\
+\hline
+
+Latency (ms)
+& 6.612 & 66.019
+& 6.481 & 66.085
+& 6.431 & 65.465
+& 6.540 & 66.129
+& 6.451 & 64.971
+\\
+
+TPS
+& 604.922 & 15.160
+& 617.167 & 15.144
+& 621.946 & 15.288
+& 611.631 & 15.134
+& 620.024 & 15.404
+\\
+
+\hline
+\end{tabular}
+}
+\end{table*}
