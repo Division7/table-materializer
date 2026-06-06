@@ -120,45 +120,26 @@ rows                          & 13.424 & 13.866 & -0.442 \\
 
 \begin{table*}[t]
 \centering
-\caption{Write performance with or without IMMV.}
+
 \label{tab:write_bench}
-\resizebox{1.25\textwidth}{!}{
-\begin{tabular}{l|cc|cc|cc|cc|cc}
+\begin{tabular}{|l|c|c|c|c|c|}
 \hline
-
-& \multicolumn{2}{c|}{rows}
-& \multicolumn{2}{c|}{total\_exec\_time}
-& \multicolumn{2}{c|}{mean\_exec\_time}
-& \multicolumn{2}{c|}{mean\_exec\_time $\times$ calls}
-& \multicolumn{2}{c}{calls}
-\\
-
-Metric
-& NO\_IMMV & WITH\_IMMV
-& NO\_IMMV & WITH\_IMMV
-& NO\_IMMV & WITH\_IMMV
-& NO\_IMMV & WITH\_IMMV
-& NO\_IMMV & WITH\_IMMV
-\\
+ & rows & total\_exec\_time &mean\_exec\_time & mean\_exec\_time $\times$ calls & calls \\
 \hline
-
-Latency (ms)
-& 6.612 & 66.019
-& 6.481 & 66.085
-& 6.431 & 65.465
-& 6.540 & 66.129
-& 6.451 & 64.971
+NO\_IMMV 
+& 6.612 
+& 6.481 
+& 6.431 
+& 6.540 
+& 6.451 
 \\
-
-TPS
-& 604.922 & 15.160
-& 617.167 & 15.144
-& 621.946 & 15.288
-& 611.631 & 15.134
-& 620.024 & 15.404
-\\
-
+WITH\_IMMV 
+& 66.019
+& 66.085
+& 65.465
+& 66.129
+& 64.971\\
 \hline
 \end{tabular}
-}
+\caption{Write performance with or without IMMV.}
 \end{table*}
