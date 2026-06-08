@@ -1,10 +1,10 @@
 \section{Introduction}
 
-Modern database and data warehouse systems support decision-making applications that require complex analytical queries over massive datasets. These queries typically involve multidimensional aggregations, joins across multiple relations, and group-by operations on data volumes ranging from terabytes to petabytes. For instance, such workloads are characteristic of Online Analytical Processing (OLAP) systems, where users repeatedly analyze data from different perspectives to discover trends, patterns, and business insights.
+Modern database and data warehouse systems support decision-making applications that require complex analytical queries over massive datasets. These queries typically involve multidimensional aggregations, joins across multiple relations, and group-by operations on data volumes ranging from terabytes to petabytes. For instance, such workloads are characteristic of Online Analytical Processing (OLAP) systems, where users repeatedly analyze data from different perspectives to discover trends and patterns.
 
 Executing analytical queries directly on base tables is often prohibitively expensive. Even with advanced indexing and query optimization techniques, the computational cost of repeatedly scanning large datasets can result in unacceptable response times. To address this challenge, database systems employ \emph{materialized views}, which are precomputed query results stored persistently. Materialized views can represent complete query answers or intermediate aggregations that accelerate the evaluation of future queries. By reusing previously computed results, a query optimizer can significantly reduce execution time and improve overall system throughput.
 
-Despite their benefits, materialized views introduce several important resource management problems. In principle, a system could materialize every possible aggregation and query result, allowing nearly instantaneous query responses. In practice, however, this approach is infeasible due to both storage limitations and maintenance costs.
+Despite their benefits, materialized views introduce several important resource management problems. In principle, a system could materialize every possible aggregation which allows nearly instantaneous query responses. In practice, however, this approach is infeasible due to both storage limitations and maintenance costs.
 
 \begin{itemize}
     \item \textbf{Storage Capacity:} The number of candidate views grows exponentially with the dimensionality of the data. For example, a data cube with $d$ dimensions contains $2^d$ possible group-by views. As modern data warehouses may contain dozens or even hundreds of dimensions, storing every possible view quickly exceeds available disk capacity.
@@ -18,46 +18,17 @@ Consequently, database administrators and query optimizers must carefully select
 
 View selection has been extensively studied in the fields of database systems and data warehousing. The problem is particularly challenging because views exhibit dependency relationships: one materialized view may help compute several other views, and the benefit of materializing a view often depends on which other views have already been selected. These dependencies create a large combinatorial search space. In fact, the view selection problem has been shown to be NP-hard, making exhaustive search impractical for realistic systems. As a result, researchers have proposed numerous heuristic and approximation techniques, including greedy algorithms, randomized search methods, genetic algorithms, simulated annealing, and cost-based optimization frameworks.
 
-Formally, the View Selection Problem can be modeled as a constrained optimization problem. Consider a query workload
+Formally, the View Selection Problem can be modeled as a constrained optimization problem. Consider a query workload $Q = \{(q_1,f_1), (q_2,f_2), \dots, (q_n,f_n)\}$ where each query $q_i$ is associated with an execution frequency $f_i$ that represents how often the query appears in the workload. Let $V = \{v_1, v_2, \dots, v_m\}$ denote the set of candidate views that may be materialized.
 
-\[
-Q = \{q_1, q_2, \dots, q_n\},
-\]
+For any subset of materialized views $M \subseteq V$, let $C(q, M)$ represent the estimated cost of answering query $q$ using the materialized views in $M$. This cost may be measured in terms of execution time, I/O operations, CPU usage, or a weighted combination of these factors. If no suitable view exists in $M$, the query must be evaluated directly from the base tables. Furthermore, let $S(v)$ denote the storage requirement of view $v$, and let $B$ be the maximum storage budget available for materialized views.
 
-where each query $q_i$ is associated with an execution frequency $f_i$ that represents how often the query appears in the workload. Let
-
-\[
-V = \{v_1, v_2, \dots, v_m\}
-\]
-
-denote the set of candidate views that may potentially be materialized.
-
-For any subset of materialized views $M \subseteq V$, let
-
-\[
-C(q, M)
-\]
-
-represent the estimated cost of answering query $q$ using the materialized views in $M$. This cost may be measured in terms of execution time, I/O operations, CPU usage, or a weighted combination of these factors. If no suitable view exists in $M$, the query must be evaluated directly from the base tables.
-
-Furthermore, let
-
-\[
-S(v)
-\]
-
-denote the storage requirement of view $v$, and let $B$ be the maximum storage budget available for materialized views.
-
-The objective is to identify a subset of views $M$ that minimizes the total workload execution cost while satisfying the storage constraint. The optimization problem can therefore be expressed as
-
+The objective is to identify a subset of materialized views $M \subseteq V$ that minimizes the total workload execution cost while satisfying the storage constraint. This problem can be expressed as
 \[
 \min_{M \subseteq V}
 \sum_{i=1}^{n}
 f_i \cdot C(q_i, M),
 \]
-
 subject to
-
 \[
 \sum_{v \in M} S(v) \le B.
 \]
