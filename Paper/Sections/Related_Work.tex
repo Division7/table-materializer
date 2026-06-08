@@ -2,7 +2,7 @@
 
 The materialized view selection problem has been extensively studied for more than three decades and remains a fundamental optimization problem in data warehousing, OLAP systems, and modern analytical databases. Since the number of candidate views grows exponentially with the dimensionality of the data and the complexity of query workloads, determining an optimal set of views under storage and maintenance constraints has been proven to be NP-hard. Consequently, a large body of research has focused on developing efficient approximation algorithms, heuristic search strategies, and more recently machine learning-based approaches.
 
-\subsubsection{Foundational Lattice Frameworks and Greedy Algorithms}
+\subsection{Foundational Lattice Frameworks and Greedy Algorithms}
 
 One of the earliest and most influential studies was conducted by \textcite{Harinarayan_1996}, who introduced the data cube lattice framework for materialized view selection. Their work modeled aggregate views as nodes in a lattice structure and proposed a greedy algorithm that iteratively materializes views providing the greatest reduction in query processing cost per unit of storage. This formulation established the foundation for much of the subsequent research on data cube optimization.
 
@@ -10,21 +10,21 @@ Building upon this framework, \textcite{Gupta_1997} introduced a generalized app
 
 To address workloads containing multiple related queries, researchers developed graph-based representations capable of capturing dependencies among intermediate results. \textcite{Yang_1997} proposed AND-OR view graphs that model alternative computation paths and shared subexpressions. Later surveys and extensions by \textcite{Chirkova_2012} further analyzed these dependency-based formulations and their applicability to large-scale warehouse environments.
 
-\subsubsection{Cost-Based Physical Design and Automated Tuning}
+\subsection{Cost-Based Physical Design and Automated Tuning}
 
 As enterprise database systems grew in scale, view selection became a central component of automated physical database design. A major milestone was the AutoAdmin project introduced by \textcite{Agrawal_2001}, which leveraged the database optimizer to estimate the utility of candidate materialized views and indexes directly from representative workloads. The resulting technology was later incorporated into commercial database tuning advisors.
 
-Subsequent work expanded the problem beyond view selection alone. \textcite{Agrawal_2000} investigated the joint selection of indexes and materialized views, demonstrating that these physical structures interact strongly and should be optimized simultaneously rather than independently. Similar cost-based frameworks were later adopted by many commercial database systems and data warehouse design tools.
+There are also other works that expanded the problem beyond view selection alone. \textcite{Agrawal_2000} investigated the joint selection of indexes and materialized views, demonstrating that these physical structures interact strongly and should be optimized simultaneously rather than independently. Similar cost-based frameworks were later adopted by many commercial database systems and data warehouse design tools.
 
 Researchers also explored workload-aware algorithms capable of automatically generating candidate views from query logs and historical workloads. These methods rely heavily on optimizer statistics and benefit estimation techniques to identify views that maximize long-term workload performance under storage constraints.
 
-\subsubsection{Metaheuristic and Evolutionary Optimization Approaches}
+\subsection{Metaheuristic and Evolutionary Optimization Approaches}
 
 Because exhaustive exploration of the candidate search space is computationally infeasible for realistic workloads, many researchers investigated metaheuristic optimization techniques. Genetic algorithms were among the earliest approaches, with \textcite{Kratica_2003} demonstrating that evolutionary search can efficiently discover near-optimal view configurations while avoiding the combinatorial explosion associated with exact algorithms.
 
 Other studies explored simulated annealing, tabu search, and hybrid evolutionary methods for navigating the large solution space. For example, \textcite{Bellatreche_2000} proposed stochastic optimization methods capable of balancing query performance improvements against maintenance overhead. These approaches generally trade optimality guarantees for scalability and have proven effective in large warehouse environments where the candidate set may contain thousands of potential views.
 
-\subsubsection{Dynamic, Adaptive, and Learning-Based Methods}
+\subsection{Dynamic, Adaptive, and Learning-Based Methods}
 
 Traditional view selection algorithms typically assume relatively stable workloads and perform optimization offline. However, modern cloud applications often exhibit rapidly changing query patterns, rendering static configurations suboptimal over time. To address this challenge, researchers began investigating adaptive and incremental view selection techniques capable of continuously adjusting materialization decisions.
 
