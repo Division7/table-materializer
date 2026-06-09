@@ -10,16 +10,16 @@ To evaluate the effectiveness of the proposed materialization strategy under dif
 
 \begin{itemize}
 
-\item \textbf{Join-Heavy Workload.}
+\item \textbf{Join-Heavy Workload:}
 This workload performs a four-way join among the \texttt{customers}, \texttt{orders}, \texttt{order\_items}, and \texttt{products} tables. The schema intentionally omits indexes on selected foreign-key attributes, forcing large sequential scans and expensive join operations. This workload represents transactional queries that repeatedly reconstruct the same join results from base tables and is intended to evaluate the benefits of materializing frequently executed join patterns.
 
-\item \textbf{Aggregation-Heavy Workload.}
-This workload executes a three-way join over the \texttt{orders}, \texttt{order\_items}, and \texttt{products} tables, followed by multiple aggregate functions and a \texttt{GROUP BY} operation. The query computes category-level statistics such as revenue, units sold, average prices, and unique customer counts. Since a large amount of data is processed to produce a compact result set, this workload is particularly suitable for evaluating the effectiveness of materialized aggregations.
-
-\item \textbf{Wide-Table Scan Workload.}
+\item \textbf{Wide-Table Scan Workload:}
 This workload targets the \texttt{wide\_metrics} relation, which contains more than forty attributes of mixed data types. Queries access only a small subset of columns while filtering and sorting on user-specific predicates. The workload evaluates whether the extension can exploit projection-based materialization by storing only frequently accessed columns instead of replicating the entire wide table.
 
-\item \textbf{Mixed Workload.}
+\item \textbf{Aggregation-Heavy Workload:}
+This workload executes a three-way join over the \texttt{orders}, \texttt{order\_items}, and \texttt{products} tables, followed by multiple aggregate functions and a \texttt{GROUP BY} operation. The query computes category-level statistics such as revenue, units sold, average prices, and unique customer counts. Since a large amount of data is processed to produce a compact result set, this workload is particularly suitable for evaluating the effectiveness of materialized aggregations.
+
+\item \textbf{Mixed Workload:}
 This workload combines analytical queries over both the \texttt{events} and \texttt{wide\_metrics} tables within the same transaction. Unlike the previous workloads, which contain a single dominant query pattern, the mixed workload presents multiple competing materialization candidates. It is therefore useful for evaluating the effectiveness of different heuristic scoring functions when selecting candidate views for materialization.
 
 \end{itemize}
@@ -50,7 +50,7 @@ total\_exec\_time             & 10.668 & 0.137 & 10.531 \\
 rows                          & 13.969 & 0.137 & 13.832 \\
 \hline
 \end{tabular}
-\caption{Read performance for \texttt{workload\_joins}.}
+\caption{Read performance for \texttt{workload\_joins}:}
 \end{table}
 
 \begin{table}[t]
@@ -71,7 +71,7 @@ total\_exec\_time             & 4.401 & 4.455 & -0.054 \\
 rows                          & 4.030 & 4.490 & -0.460 \\
 \hline
 \end{tabular}
-\caption{Read performance for \texttt{workload\_wide}.}
+\caption{Read performance for \texttt{workload\_wide}:}
 
 \end{table}
 
@@ -93,7 +93,7 @@ total\_exec\_time             & 321.700 & 325.541 & -3.841 \\
 rows                          & 235.607 & 239.127 & -3.520 \\
 \hline
 \end{tabular}
-\caption{Read performance for \texttt{workload\_agg}.}
+\caption{Read performance for \texttt{workload\_agg}:}
 \end{table}
 
 \begin{table}[t]
@@ -114,7 +114,7 @@ total\_exec\_time             & 14.196 & 13.282 & 0.914 \\
 rows                          & 13.424 & 13.866 & -0.442 \\
 \hline
 \end{tabular}
-\caption{Read performance for \texttt{workload\_mixed}.}
+\caption{Read performance for \texttt{workload\_mixed}:}
 \end{table}
 
 
@@ -141,5 +141,16 @@ WITH\_IMMV
 & 64.971\\
 \hline
 \end{tabular}
-\caption{Write performance with or without IMMV.}
+\caption{Write performance with or without IMMV:}
 \end{table*}
+
+For the joins workload, we see that all heuristics performed considerably better. This is expected since the queries are about joining multiple tables, so storing the result can save a lot of computations.
+
+
+For the wide workload, there is virtually no difference when using IMMV. It seems that when the dimension of the table is large and the data access pattern is random, our heuristics start to break down and are unable to reduce the query latency.
+
+
+For the agg workload, we see that using calls heuristic is able to greatly reduce the latency while other heuristics make little difference. In this case, the calls heuristic was able to select the “correct” views to materialize, thus reducing the latency.
+
+
+For the mixed workload, we again see that there is virtually no difference when using IMMV. Indeed, when the workload has a random data access pattern, it is difficult to predict the benefit of selecting a view.
