@@ -12,7 +12,7 @@ To address workloads containing multiple related queries, researchers developed 
 
 \subsection{Cost-Based Physical Design and Automated Tuning}
 
-As enterprise database systems grew in scale, view selection became a central component of automated physical database design. A major milestone was the AutoAdmin project introduced by \textcite{Agrawal_2001}, which exploited the database optimizer to evaluate candidate indexes and materialized views against a representative query workload, selecting those that provided the greatest estimated reduction in overall query execution cost. The technology developed through this work was later adopted by commercial database tuning tools.
+As enterprise database systems grew in scale, view selection became a central component of automated physical database design. A major milestone was the AutoAdmin project introduced by \textcite{Agrawal_2001}, which exploited the database optimizer to evaluate candidate indexes and materialized views against a representative query workload, selecting those that provided the greatest estimated reduction in overall query execution cost. The technology developed in this work was later adopted by commercial database tuning tools.
 
 There are also other works that expanded the problem beyond view selection alone. \textcite{Agrawal_2000} investigated the joint selection of indexes and materialized views, demonstrating that these physical structures interact strongly and should be optimized simultaneously rather than independently. Similar cost-based frameworks were later adopted by many commercial database systems and data warehouse design tools.
 
