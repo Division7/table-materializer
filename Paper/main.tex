@@ -126,7 +126,7 @@
 %% The abstract is a short summary of the work to be presented in the
 %% article.
 \begin{abstract}
-	In this project, we develop a Postgres extension designed to automatically select and create view subsets of existing tables in order to facilitate faster reads. It includes a set of configurable options, including minimum call time and minimum number of calls. We then run a our extension through a number of benchmarks, testing it with a number of heuristics. We find that regardless of heuristic, that we see a very significant latency decrease in workloads including joined tables. Additionally, across all workloads, we see a roughly 10x increase in write time due to the overhead incurred by Postgres IVM; However, we deem this to be acceptable as view selection problems are aimed at read-heavy rather than write-heavy workloads.
+	In this project, we develop a Postgres extension designed to automatically select and create view subsets of existing tables in order to facilitate faster reads. It uses a curatable heuristic to select what queries should be materialized into views, powered by data provided by pg\_stat\_statement. We then run our extension through a number of benchmarks, testing it with a number of heuristics. We find that regardless of the heuristic, we see a very significant latency decrease in workloads involving joining tables. Additionally, across all workloads, we see a roughly 10x increase in write latency due to the overhead incurred by Postgres IVM. However, we deem this to be acceptable as view selection problems are aimed at read-heavy rather than write-heavy workloads.
 \end{abstract}
 
 %%
